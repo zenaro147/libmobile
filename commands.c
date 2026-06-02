@@ -325,7 +325,6 @@ static struct mobile_packet *command_tel_ip(struct mobile_adapter *adapter, stru
     }
 
     s->state = MOBILE_CONNECTION_CALL;
-    s->call_packets_sent = 0;
 
     packet->length = 0;
     return packet;
@@ -361,7 +360,6 @@ static struct mobile_packet *command_tel_relay(struct mobile_adapter *adapter, s
     }
 
     s->state = MOBILE_CONNECTION_CALL;
-    s->call_packets_sent = 0;
 
     packet->length = 0;
     return packet;
@@ -464,7 +462,6 @@ static struct mobile_packet *command_wait_call_ip(struct mobile_adapter *adapter
     if (!mobile_cb_sock_accept(adapter, 0)) return NULL;
 
     s->state = MOBILE_CONNECTION_CALL_RECV;
-    s->call_packets_sent = 0;
 
     packet->length = 0;
     return packet;
@@ -500,7 +497,6 @@ static struct mobile_packet *command_wait_call_relay(struct mobile_adapter *adap
     }
 
     s->state = MOBILE_CONNECTION_CALL_RECV;
-    s->call_packets_sent = 0;
 
     packet->length = 0;
     return packet;
@@ -625,31 +621,19 @@ static struct mobile_packet *command_data(struct mobile_adapter *adapter, struct
             }
             return NULL;
         }
+    }
 
-        // Pokémon Crystal expects communications to be "synchronized".
-        // For this, we only try to receive packets when we've sent one.
-        // TODO: Check other games with peer to peer functionality.
-        if (!internet) {
-            if (s->call_packets_sent < 0xFF) s->call_packets_sent++;
+    int recv_size = mobile_cb_sock_recv(adapter, conn, data,
+        MOBILE_MAX_TRANSFER_SIZE, NULL);
+
+    if (recv_size == -2) {
+        // If connected to the internet, and a disconnect is received, we
+        // should inform the game about a remote disconnect.
+        if (internet) {
+            mobile_cb_sock_close(adapter, conn);
+            s->connections[conn] = false;
+            packet->command = MOBILE_COMMAND_DATA_END;
         }
-    }
-
-    int recv_size = 0;
-    if (internet || s->call_packets_sent) {
-        recv_size = mobile_cb_sock_recv(adapter, conn, data,
-            MOBILE_MAX_TRANSFER_SIZE, NULL);
-    }
-
-    if (!internet && recv_size > 0) {
-        if (s->call_packets_sent > 0) s->call_packets_sent--;
-    }
-
-    // If connected to the internet, and a disconnect is received, we should
-    // inform the game about a remote disconnect.
-    if (internet && recv_size == -2) {
-        mobile_cb_sock_close(adapter, conn);
-        s->connections[conn] = false;
-        packet->command = MOBILE_COMMAND_DATA_END;
         packet->length = 1;
         return packet;
     }

@@ -424,6 +424,16 @@ static struct mobile_packet *command_wait_call_begin(struct mobile_adapter *adap
     // Time out if anything fails
     s->state = MOBILE_CONNECTION_WAIT_TIMEOUT;
 
+    // Close any connection left over from a previous command_tel_begin
+    // (Dial) attempt -- mirrors the same defensive close command_tel_begin
+    // already does for a connection left over from this function, see its
+    // comment there. mobile_cb_sock_open() below requires the slot to
+    // already be closed (real implementations may assert this).
+    if (s->connections[p2p_conn]) {
+        mobile_cb_sock_close(adapter, p2p_conn);
+        s->connections[p2p_conn] = false;
+    }
+
     if (adapter->config.relay.type != MOBILE_ADDRTYPE_NONE) {
         mobile_addr_copy(&b->processing_addr, &adapter->config.relay);
         mobile_relay_init(adapter);
@@ -608,7 +618,18 @@ static struct mobile_packet *command_data(struct mobile_adapter *adapter, struct
     if (send_size > sent_size) {
         int rc = mobile_cb_sock_send(adapter, conn, data + sent_size,
             send_size - sent_size, NULL);
-        if (rc < 0) return error_packet(packet, 0);
+        if (rc < 0) {
+            // A broken P2P socket isn't information a real Mobile Adapter
+            // could have given the game either, same reasoning as the
+            // recv_size == -2 and recv_size < 0 cases below (a P2P call
+            // is meant to look like a live phone line, which has no
+            // "the socket errored" equivalent) -- so for P2P, silently
+            // treat this as if the remaining bytes had been sent, and
+            // let the game notice a dead call on its own, the same way
+            // it always could have on real 2001 hardware.
+            if (internet) return error_packet(packet, 0);
+            rc = (int)(send_size - sent_size);
+        }
         sent_size += rc;
         b->processing_data[PROCDATA_DATA_SENT_SIZE] = sent_size;
 
@@ -641,8 +662,18 @@ static struct mobile_packet *command_data(struct mobile_adapter *adapter, struct
     // Allow echoing this packet
     if (recv_size == -10) return packet;
 
-    // Any other errors should raise a proper error
-    if (recv_size < 0) return error_packet(packet, 0);
+    // Any other errors should raise a proper error -- except over a P2P
+    // call, for the same reason recv_size == -2 is only reported to the
+    // game in internet mode above: a dead call isn't a detectable state
+    // to a real Mobile Adapter over a phone line either, so this stays
+    // silent for P2P and lets the game time out on its own instead.
+    if (recv_size < 0) {
+        if (!internet) {
+            packet->length = 1;
+            return packet;
+        }
+        return error_packet(packet, 0);
+    }
 
     // If nothing was sent, try to receive for at least one second
     // TODO: Don't delay for UDP connections

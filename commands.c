@@ -424,16 +424,6 @@ static struct mobile_packet *command_wait_call_begin(struct mobile_adapter *adap
     // Time out if anything fails
     s->state = MOBILE_CONNECTION_WAIT_TIMEOUT;
 
-    // Close any connection left over from a previous command_tel_begin
-    // (Dial) attempt -- mirrors the same defensive close command_tel_begin
-    // already does for a connection left over from this function, see its
-    // comment there. mobile_cb_sock_open() below requires the slot to
-    // already be closed (real implementations may assert this).
-    if (s->connections[p2p_conn]) {
-        mobile_cb_sock_close(adapter, p2p_conn);
-        s->connections[p2p_conn] = false;
-    }
-
     if (adapter->config.relay.type != MOBILE_ADDRTYPE_NONE) {
         mobile_addr_copy(&b->processing_addr, &adapter->config.relay);
         mobile_relay_init(adapter);

@@ -7,6 +7,7 @@
 #include "mobile_inet.h"
 #include "util.h"
 #include "compat.h"
+#include "device_auth.h"
 
 #ifdef MOBILE_LIBCONF_USE
 #include <mobile_config.h>
@@ -89,6 +90,11 @@ static bool do_ppp_disconnect(struct mobile_adapter *adapter)
         if (s->connections[conn]) {
             mobile_cb_sock_close(adapter, conn);
             s->connections[conn] = false;
+            if (s->mail_conn[conn]) {
+                s->mail_conn[conn] = false;
+                mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_DEAUTHORIZE,
+                    s->ppp_id, s->ppp_id_size);
+            }
         }
     }
     s->state = MOBILE_CONNECTION_CALL_ISP;
@@ -141,6 +147,7 @@ static void do_start_session(struct mobile_adapter *adapter)
     s->session_started = true;
     s->state = MOBILE_CONNECTION_DISCONNECTED;
     memset(s->connections, false, sizeof(s->connections));
+    memset(s->mail_conn, false, sizeof(s->mail_conn));
 
     mobile_number_fetch_cancel(adapter);
 }
@@ -821,7 +828,8 @@ static struct mobile_packet *command_ppp_connect(struct mobile_adapter *adapter,
     if (packet->data + packet->length < data + id_size + 1) {
         return error_packet(packet, 2);
     }
-    // const unsigned char *id = data;
+    s->ppp_id_size = (unsigned char)id_size;
+    memcpy(s->ppp_id, data, id_size);
     data += id_size;
     unsigned pass_size = *data++;
     if (pass_size > 0x20) pass_size = 0x20;
@@ -975,6 +983,16 @@ static struct mobile_packet *command_tcp_connect_connecting(struct mobile_adapte
         }
     }
 
+    // A POP3 connection is a reliable, precise signal that the game is
+    //   about to use mail, without depending on the SMTP port rewriting
+    //   logic above. Fires a device-auth authorize event, tracking this
+    //   connection so its eventual close can fire the matching deauthorize.
+    if ((packet->data[4] << 8 | packet->data[5]) == 110) {
+        s->mail_conn[conn] = true;
+        mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_AUTHORIZE,
+            s->ppp_id, s->ppp_id_size);
+    }
+
     packet->data[0] = conn;
     packet->length = 1;
     return packet;
@@ -1031,6 +1049,11 @@ static struct mobile_packet *command_tcp_disconnect(struct mobile_adapter *adapt
     }
     mobile_cb_sock_close(adapter, conn);
     s->connections[conn] = false;
+    if (s->mail_conn[conn]) {
+        s->mail_conn[conn] = false;
+        mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_DEAUTHORIZE,
+            s->ppp_id, s->ppp_id_size);
+    }
 
     packet->length = 1;
     return packet;

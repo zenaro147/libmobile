@@ -59,6 +59,8 @@ set(sources
     config.h
     debug.c
     debug.h
+    device_auth.c
+    device_auth.h
     dns.c
     dns.h
     global.h
@@ -69,6 +71,8 @@ set(sources
     relay.h
     serial.c
     serial.h
+    sha256.c
+    sha256.h
     util.c
     util.h
 )

@@ -67,6 +67,17 @@ struct mobile_adapter_commands {
     bool dns2_use;
     struct mobile_addr4 dns1;
     struct mobile_addr4 dns2;
+
+    // ISP login ID sent by the game in PPP Connect, kept around for the
+    //   lifetime of the internet session, to sign device-auth requests
+    //   (see device_auth.h). Not otherwise used by the emulated protocol.
+    unsigned char ppp_id[0x20];
+    unsigned char ppp_id_size;
+
+    // Tracks which of the connections above are known to be a POP3
+    //   connection (destination port 110), to fire a device-auth
+    //   deauthorize event when that specific connection is closed.
+    bool mail_conn[MOBILE_MAX_CONNECTIONS];
 };
 
 void mobile_commands_init(struct mobile_adapter *adapter);

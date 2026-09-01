@@ -124,6 +124,17 @@ void mobile_number_fetch_reset(struct mobile_adapter *adapter)
 static void number_fetch_handle(struct mobile_adapter *adapter)
 {
     if (!adapter->global.number_fetch_active) {
+        // Missing relay_token is a static configuration fact, not a
+        //   transient network failure, so retrying won't help -- warn once
+        //   and give up immediately instead of spending any retries.
+        if (!adapter->config.relay_token_init) {
+            debug_prefix(adapter);
+            mobile_debug_print(adapter, PSTR("No relay token configured"));
+            mobile_debug_endl(adapter);
+            adapter->global.number_fetch_retries = 0;
+            return;
+        }
+
         debug_prefix(adapter);
         mobile_debug_print(adapter, "Checking mobile number...");
         mobile_debug_endl(adapter);

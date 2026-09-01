@@ -344,6 +344,16 @@ int mobile_relay_connect(struct mobile_adapter *adapter, unsigned char conn, con
 
     switch (s->state) {
     case MOBILE_RELAY_DISCONNECTED:
+        // The relay server no longer accepts a handshake without a token
+        //   (anonymous registration was removed), so don't bother
+        //   connecting at all without one already provisioned.
+        if (!adapter->config.relay_token_init) {
+            debug_prefix(adapter);
+            mobile_debug_print(adapter, PSTR("No relay token configured"));
+            mobile_debug_endl(adapter);
+            return -1;
+        }
+
         debug_prefix(adapter);
         mobile_debug_print(adapter, PSTR("Connecting to "));
         mobile_debug_print_addr(adapter, server);

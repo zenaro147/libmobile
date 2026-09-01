@@ -22,6 +22,7 @@ struct mobile_adapter;
 #define MOBILE_MAX_NUMBER_SIZE 0x20  // Allowed phone number length: 7-16
 #define MOBILE_CONFIG_SIZE 0x200
 #define MOBILE_RELAY_TOKEN_SIZE 0x10
+#define MOBILE_DEVICE_AUTH_SIG_SIZE 0x20
 
 // Utility defines
 #define MOBILE_SERIAL_IDLE_BYTE 0xD2
@@ -70,6 +71,11 @@ enum mobile_addrtype {
 enum mobile_number {
     MOBILE_NUMBER_USER,
     MOBILE_NUMBER_PEER
+};
+
+enum mobile_device_auth_action {
+    MOBILE_DEVICE_AUTH_AUTHORIZE,
+    MOBILE_DEVICE_AUTH_DEAUTHORIZE
 };
 
 enum mobile_dns {
@@ -415,6 +421,36 @@ void mobile_def_sock_recv(struct mobile_adapter *adapter, mobile_func_sock_recv 
 typedef void (*mobile_func_update_number)(void *user, enum mobile_number type, const char *number);
 void mobile_impl_update_number(void *user, enum mobile_number type, const char *number);
 void mobile_def_update_number(struct mobile_adapter *adapter, mobile_func_update_number func);
+
+// mobile_func_update_device_auth - Device authorization side channel event
+//
+// This is an extension beyond the original Mobile Adapter GB protocol. It's
+// called whenever the library detects that the connected game has opened (or
+// stopped using) a POP3 connection (destination port 110) while logged in to
+// an ISP, alongside a signature that a frontend MAY use to authorize (or
+// deauthorize) this device with a compatible, cooperating mail relay server,
+// via whatever side channel that server expects (e.g. an HTTP request). This
+// has no effect on, and is entirely independent from, the emulated protocol
+// session itself.
+//
+// Frontends that don't implement such a side channel should leave this
+// callback unset, in which case it will simply never be called, as it relies
+// on a device_auth key having been provisioned through the config storage
+// first (see mobile_func_config_read). Implementing this callback must not
+// block, as it's called synchronously from within the library.
+//
+// Parameters:
+// - action: whether this is an authorization or deauthorization event
+// - ppp_id: the ISP login ID the game sent in the PPP Connect command, as a
+//   byte string that is NOT null-terminated
+// - ppp_id_size: length of ppp_id, at most 0x20
+// - counter: value that must be included, as its decimal representation
+//   without leading zeros, in the message that was signed to produce <sig>
+// - sig: raw MOBILE_DEVICE_AUTH_SIG_SIZE-byte HMAC-SHA256 signature, that a
+//   cooperating server can verify to trust this request
+typedef void (*mobile_func_update_device_auth)(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig);
+void mobile_impl_update_device_auth(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig);
+void mobile_def_update_device_auth(struct mobile_adapter *adapter, mobile_func_update_device_auth func);
 
 void mobile_config_set_device(struct mobile_adapter *adapter, enum mobile_adapter_device device, bool unmetered);
 void mobile_config_get_device(struct mobile_adapter *adapter, enum mobile_adapter_device *device, bool *unmetered);

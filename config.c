@@ -15,6 +15,15 @@
 static_assert(MOBILE_CONFIG_SIZE >= MOBILE_CONFIG_OFFSET_LIBRARY +
     MOBILE_CONFIG_SIZE_LIBRARY, "MOBILE_CONFIG_SIZE isn't big enough!");
 
+// Independent extension area, holding the device-auth key/counter. Kept
+//   separate from the "library" area above (rather than using up its
+//   remaining unused bytes) so it can be provisioned/versioned on its own,
+//   without disturbing the existing area's checksum.
+#define MOBILE_CONFIG_OFFSET_DEVICE_AUTH 0x160
+#define MOBILE_CONFIG_SIZE_DEVICE_AUTH 0x2D
+static_assert(MOBILE_CONFIG_SIZE >= MOBILE_CONFIG_OFFSET_DEVICE_AUTH +
+    MOBILE_CONFIG_SIZE_DEVICE_AUTH, "MOBILE_CONFIG_SIZE isn't big enough!");
+
 static uint16_t checksum(unsigned char *buf, unsigned len)
 {
     uint16_t sum = 0;
@@ -183,6 +192,90 @@ static void config_library_save(struct mobile_adapter *adapter)
         sizeof(buffer));
 }
 
+// Layout of the device-auth extension area (MOBILE_CONFIG_SIZE_DEVICE_AUTH
+//   bytes, starting at MOBILE_CONFIG_OFFSET_DEVICE_AUTH):
+//   0x00      'D'
+//   0x01      'A'
+//   0x02      0 (version)
+//   0x03-0x04 checksum (little-endian, over everything from 0x05 onward)
+//   0x05-0x24 device_auth_key (32 bytes)
+//   0x25-0x2c device_auth_counter (uint64, little-endian)
+static bool config_device_auth_load(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_config *config = &adapter->config;
+
+    unsigned char buffer[MOBILE_CONFIG_SIZE_DEVICE_AUTH];
+    if (!mobile_cb_config_read(adapter, buffer, MOBILE_CONFIG_OFFSET_DEVICE_AUTH,
+            sizeof(buffer))) {
+        return false;
+    }
+
+    if (buffer[0] != 'D') return false;
+    if (buffer[1] != 'A') return false;
+    if (buffer[2] != 0) return false;
+    uint16_t sum = checksum(buffer + 5, sizeof(buffer) - 5);
+    uint16_t config_sum = buffer[3] | buffer[4] << 8;
+    if (sum != config_sum) return false;
+
+    static_assert(sizeof(config->device_auth_key) == 0x20,
+        "device_auth_key size mismatch");
+    memcpy(config->device_auth_key, buffer + 0x05,
+        sizeof(config->device_auth_key));
+
+    uint64_t counter = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        counter |= (uint64_t)buffer[0x25 + i] << (8 * i);
+    }
+    config->device_auth_counter = counter;
+    config->device_auth_key_init = true;
+    return true;
+}
+
+static void config_device_auth_save(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_config *config = &adapter->config;
+    if (!config->device_auth_key_init) return;
+
+    unsigned char buffer[MOBILE_CONFIG_SIZE_DEVICE_AUTH];
+    buffer[0] = 'D';
+    buffer[1] = 'A';
+    buffer[2] = 0;
+
+    memcpy(buffer + 0x05, config->device_auth_key,
+        sizeof(config->device_auth_key));
+    for (unsigned i = 0; i < 8; i++) {
+        buffer[0x25 + i] = (unsigned char)(config->device_auth_counter >> (8 * i));
+    }
+
+    uint16_t sum = checksum(buffer + 5, sizeof(buffer) - 5);
+    buffer[0x03] = sum & 0xff;
+    buffer[0x04] = sum >> 8;
+
+    mobile_cb_config_write(adapter, buffer, MOBILE_CONFIG_OFFSET_DEVICE_AUTH,
+        sizeof(buffer));
+}
+
+bool mobile_config_get_device_auth_key(struct mobile_adapter *adapter, unsigned char *key)
+{
+    if (!adapter->config.device_auth_key_init) return false;
+    memcpy(key, adapter->config.device_auth_key,
+        sizeof(adapter->config.device_auth_key));
+    return true;
+}
+
+// Returns the next, not-yet-used counter value to sign a device-auth
+//   request with, having already durably persisted it, so that it can never
+//   be handed out again, even if the program crashes right after this call.
+bool mobile_config_device_auth_next(struct mobile_adapter *adapter, uint64_t *counter)
+{
+    if (!adapter->config.device_auth_key_init) return false;
+
+    adapter->config.device_auth_counter++;
+    *counter = adapter->config.device_auth_counter;
+    config_device_auth_save(adapter);
+    return true;
+}
+
 void mobile_config_init(struct mobile_adapter *adapter)
 {
     adapter->config.loaded = false;
@@ -195,6 +288,9 @@ void mobile_config_init(struct mobile_adapter *adapter)
     adapter->config.relay_token_init = false;
     adapter->config.mail_port = true;
     memset(adapter->config.relay_token, 0, MOBILE_RELAY_TOKEN_SIZE);
+    adapter->config.device_auth_key_init = false;
+    adapter->config.device_auth_counter = 0;
+    memset(adapter->config.device_auth_key, 0, MOBILE_DEVICE_AUTH_KEY_SIZE);
 }
 
 void mobile_config_load(struct mobile_adapter *adapter)
@@ -202,6 +298,7 @@ void mobile_config_load(struct mobile_adapter *adapter)
     if (adapter->global.start) return;
     if (!config_internal_verify(adapter)) config_internal_clear(adapter);
     if (config_library_load(adapter)) adapter->config.dirty = false;
+    config_device_auth_load(adapter);
     adapter->config.loaded = true;
 }
 

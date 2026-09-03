@@ -75,6 +75,34 @@ static int relay_recv(struct mobile_adapter *adapter, unsigned conn, unsigned si
     return (int)size;
 }
 
+static void relay_send_reset(struct mobile_adapter *adapter)
+{
+    adapter->buffer.relay.size = 0;
+}
+
+// Retries sending the pending b->data[0..send_size) message. Must only be
+//   called after a relay_*_build() function has set send_size and after
+//   relay_send_reset() -- see the MOBILE_RELAY_SEND_* states below.
+// Returns 1 once the whole message has been sent, 0 if not yet complete
+//   (mobile_cb_sock_send() is documented as non-blocking, and may legally
+//   accept less than requested, or nothing at all, in one call), or -1 on
+//   a real socket error.
+static int relay_send(struct mobile_adapter *adapter, unsigned conn)
+{
+    struct mobile_buffer_relay *b = &adapter->buffer.relay;
+
+    if (b->size >= b->send_size) return 1;
+
+    int rc = mobile_cb_sock_send(adapter, conn, b->data + b->size,
+        b->send_size - b->size, NULL);
+    if (rc < 0) return -1;
+
+    b->size += (unsigned)rc;
+    if (b->size < b->send_size) return 0;
+
+    return 1;
+}
+
 static void relay_handshake_send_debug(struct mobile_adapter *adapter)
 {
     debug_prefix(adapter);
@@ -93,7 +121,7 @@ static void relay_handshake_send_debug(struct mobile_adapter *adapter)
     mobile_debug_endl(adapter);
 }
 
-static bool relay_handshake_send(struct mobile_adapter *adapter, unsigned char conn)
+static void relay_handshake_build(struct mobile_adapter *adapter)
 {
     struct mobile_buffer_relay *b = &adapter->buffer.relay;
 
@@ -104,7 +132,7 @@ static bool relay_handshake_send(struct mobile_adapter *adapter, unsigned char c
     auth[0] = mobile_config_get_relay_token(adapter, auth + 1);
     if (auth[0]) size += MOBILE_RELAY_TOKEN_SIZE;
 
-    return mobile_cb_sock_send(adapter, conn, b->data, size, NULL);
+    b->send_size = size;
 }
 
 static void relay_handshake_recv_debug(struct mobile_adapter *adapter)
@@ -161,18 +189,18 @@ static void relay_call_send_debug(struct mobile_adapter *adapter, const char *nu
     mobile_debug_endl(adapter);
 }
 
-static bool relay_call_send(struct mobile_adapter *adapter, unsigned char conn, const char *number, unsigned number_len)
+static bool relay_call_build(struct mobile_adapter *adapter, const char *number, unsigned number_len)
 {
     struct mobile_buffer_relay *b = &adapter->buffer.relay;
 
     if (number_len > MOBILE_RELAY_MAX_NUMBER_SIZE) return false;
-    unsigned size = 3 + number_len;
     b->data[0] = PROTOCOL_VERSION;
     b->data[1] = MOBILE_RELAY_COMMAND_CALL;
     b->data[2] = number_len;
     memcpy(b->data + 3, number, number_len);
+    b->send_size = 3 + number_len;
 
-    return mobile_cb_sock_send(adapter, conn, b->data, size, NULL);
+    return true;
 }
 
 static void relay_call_recv_debug(struct mobile_adapter *adapter)
@@ -219,15 +247,13 @@ static void relay_wait_send_debug(struct mobile_adapter *adapter)
     mobile_debug_endl(adapter);
 }
 
-static bool relay_wait_send(struct mobile_adapter *adapter, unsigned char conn)
+static void relay_wait_build(struct mobile_adapter *adapter)
 {
     struct mobile_buffer_relay *b = &adapter->buffer.relay;
 
-    unsigned size = 2;
     b->data[0] = PROTOCOL_VERSION;
     b->data[1] = MOBILE_RELAY_COMMAND_WAIT;
-
-    return mobile_cb_sock_send(adapter, conn, b->data, size, NULL);
+    b->send_size = 2;
 }
 
 static void relay_wait_recv_debug(struct mobile_adapter *adapter)
@@ -281,15 +307,13 @@ static void relay_get_number_send_debug(struct mobile_adapter *adapter)
     mobile_debug_endl(adapter);
 }
 
-static bool relay_get_number_send(struct mobile_adapter *adapter, unsigned char conn)
+static void relay_get_number_build(struct mobile_adapter *adapter)
 {
     struct mobile_buffer_relay *b = &adapter->buffer.relay;
 
-    unsigned size = 2;
     b->data[0] = PROTOCOL_VERSION;
     b->data[1] = MOBILE_RELAY_COMMAND_GET_NUMBER;
-
-    return mobile_cb_sock_send(adapter, conn, b->data, size, NULL);
+    b->send_size = 2;
 }
 
 static void relay_get_number_recv_debug(struct mobile_adapter *adapter)
@@ -373,7 +397,22 @@ int mobile_relay_connect(struct mobile_adapter *adapter, unsigned char conn, con
         }
 
         relay_handshake_send_debug(adapter);
-        if (!relay_handshake_send(adapter, conn)) return -1;
+        relay_handshake_build(adapter);
+        relay_send_reset(adapter);
+        s->state = MOBILE_RELAY_SEND_HANDSHAKE;
+        // fallthrough
+
+    case MOBILE_RELAY_SEND_HANDSHAKE:
+        rc = relay_send(adapter, conn);
+        if (rc == 0) return 0;
+        if (rc < 0) {
+            debug_prefix(adapter);
+            mobile_debug_print(adapter, PSTR("Connection failed"));
+            mobile_debug_endl(adapter);
+            s->state = MOBILE_RELAY_DISCONNECTED;
+            return -1;
+        }
+
         relay_recv_reset(adapter);
         s->state = MOBILE_RELAY_RECV_HANDSHAKE;
         return 0;
@@ -417,7 +456,19 @@ int mobile_relay_call(struct mobile_adapter *adapter, unsigned char conn, const 
     switch (s->state) {
     case MOBILE_RELAY_CONNECTED:
         relay_call_send_debug(adapter, number, number_len);
-        if (!relay_call_send(adapter, conn, number, number_len)) return -1;
+        if (!relay_call_build(adapter, number, number_len)) return -1;
+        relay_send_reset(adapter);
+        s->state = MOBILE_RELAY_SEND_CALL;
+        // fallthrough
+
+    case MOBILE_RELAY_SEND_CALL:
+        rc = relay_send(adapter, conn);
+        if (rc == 0) return 0;
+        if (rc < 0) {
+            s->state = MOBILE_RELAY_CONNECTED;
+            return -1;
+        }
+
         relay_recv_reset(adapter);
         s->state = MOBILE_RELAY_RECV_CALL;
         return 0;
@@ -470,7 +521,19 @@ int mobile_relay_wait(struct mobile_adapter *adapter, unsigned char conn, char *
     switch (s->state) {
     case MOBILE_RELAY_CONNECTED:
         relay_wait_send_debug(adapter);
-        if (!relay_wait_send(adapter, conn)) return -1;
+        relay_wait_build(adapter);
+        relay_send_reset(adapter);
+        s->state = MOBILE_RELAY_SEND_WAIT;
+        // fallthrough
+
+    case MOBILE_RELAY_SEND_WAIT:
+        rc = relay_send(adapter, conn);
+        if (rc == 0) return 0;
+        if (rc < 0) {
+            s->state = MOBILE_RELAY_CONNECTED;
+            return -1;
+        }
+
         relay_recv_reset(adapter);
         s->state = MOBILE_RELAY_RECV_WAIT;
         return 0;
@@ -522,7 +585,19 @@ int mobile_relay_get_number(struct mobile_adapter *adapter, unsigned char conn, 
     switch (s->state) {
     case MOBILE_RELAY_CONNECTED:
         relay_get_number_send_debug(adapter);
-        if (!relay_get_number_send(adapter, conn)) return -1;
+        relay_get_number_build(adapter);
+        relay_send_reset(adapter);
+        s->state = MOBILE_RELAY_SEND_GET_NUMBER;
+        // fallthrough
+
+    case MOBILE_RELAY_SEND_GET_NUMBER:
+        rc = relay_send(adapter, conn);
+        if (rc == 0) return 0;
+        if (rc < 0) {
+            s->state = MOBILE_RELAY_CONNECTED;
+            return -1;
+        }
+
         relay_recv_reset(adapter);
         s->state = MOBILE_RELAY_RECV_GET_NUMBER;
         return 0;

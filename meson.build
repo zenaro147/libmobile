@@ -64,6 +64,8 @@ sources = [
   'inet_pton.c',
   'mobile.c',
   'mobile_data.h',
+  'pop3_auth.c',
+  'pop3_auth.h',
   'relay.c',
   'relay.h',
   'serial.c',

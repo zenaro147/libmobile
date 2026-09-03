@@ -204,6 +204,16 @@ static bool config_device_auth_load(struct mobile_adapter *adapter)
 {
     struct mobile_adapter_config *config = &adapter->config;
 
+    // Once established in memory, this is always authoritative and must
+    //   never be rewound by a later reload: mobile_config_load() has no
+    //   guard against being called again by the frontend after the first
+    //   time (its only check is against mobile_start()/mobile_stop(), not
+    //   against having already loaded), and re-reading storage that
+    //   happens to not yet reflect the last device-auth write (a write
+    //   whose durability is entirely up to the frontend's config_write
+    //   implementation) would silently roll the replay counter backwards.
+    if (config->device_auth_key_init) return true;
+
     unsigned char buffer[MOBILE_CONFIG_SIZE_DEVICE_AUTH];
     if (!mobile_cb_config_read(adapter, buffer, MOBILE_CONFIG_OFFSET_DEVICE_AUTH,
             sizeof(buffer))) {
@@ -261,6 +271,21 @@ bool mobile_config_get_device_auth_key(struct mobile_adapter *adapter, unsigned 
     memcpy(key, adapter->config.device_auth_key,
         sizeof(adapter->config.device_auth_key));
     return true;
+}
+
+// Provisions a new device_auth_key (e.g. one just received live from
+//   XPROVISION), replacing any existing one. The counter is reset to 0,
+//   since it's meaningless against a key the server has never seen a
+//   counter value for yet.
+void mobile_config_set_device_auth_key(struct mobile_adapter *adapter, const unsigned char *key)
+{
+    struct mobile_adapter_config *config = &adapter->config;
+
+    memcpy(config->device_auth_key, key, sizeof(config->device_auth_key));
+    config->device_auth_counter = 0;
+    config->device_auth_key_init = true;
+
+    config_device_auth_save(adapter);
 }
 
 // Returns the next, not-yet-used counter value to sign a device-auth

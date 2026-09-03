@@ -20,5 +20,6 @@ struct mobile_adapter_dns {
 };
 
 void mobile_dns_init(struct mobile_adapter *adapter);
-bool mobile_dns_request_send(struct mobile_adapter *adapter, unsigned conn, const struct mobile_addr *addr_send, const char *host, unsigned host_len);
+bool mobile_dns_request_build(struct mobile_adapter *adapter, const char *host, unsigned host_len);
+int mobile_dns_request_send(struct mobile_adapter *adapter, unsigned conn, const struct mobile_addr *addr_send);
 int mobile_dns_request_recv(struct mobile_adapter *adapter, unsigned conn, const struct mobile_addr *addr_send, const char *host, unsigned host_len, unsigned char *ip);

@@ -9,9 +9,6 @@
 // We have no idea of the effects of this in other games.
 #define MOBILE_CONFIG_DEVICE_UNMETERED 0x80
 
-// Size of the per-account secret used to sign device-auth requests
-#define MOBILE_DEVICE_AUTH_KEY_SIZE 0x20
-
 struct mobile_adapter_config {
     // Whether the config has already been loaded
     bool loaded: 1;
@@ -60,7 +57,6 @@ struct mobile_adapter_config {
 
 void mobile_config_init(struct mobile_adapter *adapter);
 void mobile_config_set_relay_token_internal(struct mobile_adapter *adapter, const unsigned char *token);
-bool mobile_config_get_device_auth_key(struct mobile_adapter *adapter, unsigned char *key);
 bool mobile_config_device_auth_next(struct mobile_adapter *adapter, uint64_t *counter);
 
 #undef _Atomic  // "atomic.h"

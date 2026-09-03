@@ -18,6 +18,13 @@ enum mobile_relay_state {
     MOBILE_RELAY_CONNECTED,
     MOBILE_RELAY_LINKED,
 
+    // Sending command states (retried across calls, since
+    //   mobile_cb_sock_send() may accept less than requested)
+    MOBILE_RELAY_SEND_HANDSHAKE,
+    MOBILE_RELAY_SEND_CALL,
+    MOBILE_RELAY_SEND_WAIT,
+    MOBILE_RELAY_SEND_GET_NUMBER,
+
     // Waiting for command states
     MOBILE_RELAY_RECV_CONNECT,
     MOBILE_RELAY_RECV_HANDSHAKE,
@@ -45,7 +52,14 @@ enum mobile_relay_wait_result {
 };
 
 struct mobile_buffer_relay {
+    // Bytes sent or received so far in the current phase (send or recv;
+    //   never both at once, so this is shared between them)
     unsigned char size;
+
+    // Total size of the outgoing message pending in data[], while a
+    //   MOBILE_RELAY_SEND_* state is retrying to send it in full
+    unsigned char send_size;
+
     unsigned char data[MOBILE_RELAY_PACKET_SIZE];
 };
 

@@ -218,18 +218,36 @@ static int dns_get_answer(struct mobile_buffer_dns *state, unsigned *offset, con
     return rdata;
 }
 
-bool mobile_dns_request_send(struct mobile_adapter *adapter, unsigned conn, const struct mobile_addr *addr_send, const char *host, unsigned host_len)
+// Builds the query once (assigning it a fresh transaction id) into the
+//   adapter's DNS buffer. Must be followed by mobile_dns_request_send(),
+//   retried as many times as it takes to actually get it out -- unlike this
+//   build step, sending must never be repeated with a new id/rebuild, or
+//   the query in flight would silently change under it.
+bool mobile_dns_request_build(struct mobile_adapter *adapter, const char *host, unsigned host_len)
 {
     struct mobile_adapter_dns *s = &adapter->dns;
     struct mobile_buffer_dns *b = &adapter->buffer.dns;
 
-    if (!dns_make_query(b, ++s->id, DNS_QTYPE_A, host, host_len)) return false;
+    return dns_make_query(b, ++s->id, DNS_QTYPE_A, host, host_len);
+}
 
-    if (!mobile_cb_sock_send(adapter, conn, b->data, b->size, addr_send)) {
-        return false;
-    }
+// Returns: 1 once the whole query has been sent, 0 if not yet (retry),
+//   -1 on a real socket error.
+//
+// mobile_cb_sock_send() is non-blocking and may accept less than
+//   requested, or nothing at all -- but unlike a TCP byte stream, a UDP
+//   datagram can't be completed by sending "the rest" in a later call, so
+//   any non-error, non-complete result here just means: try sending the
+//   whole thing again.
+int mobile_dns_request_send(struct mobile_adapter *adapter, unsigned conn, const struct mobile_addr *addr_send)
+{
+    struct mobile_buffer_dns *b = &adapter->buffer.dns;
 
-    return true;
+    int rc = mobile_cb_sock_send(adapter, conn, b->data, b->size, addr_send);
+    if (rc < 0) return -1;
+    if ((unsigned)rc < b->size) return 0;
+
+    return 1;
 }
 
 // Returns: -1 on error, 0 if processing, 1 on success

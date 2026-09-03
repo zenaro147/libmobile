@@ -8,6 +8,7 @@
 #include "util.h"
 #include "compat.h"
 #include "device_auth.h"
+#include "pop3_auth.h"
 
 #ifdef MOBILE_LIBCONF_USE
 #include <mobile_config.h>
@@ -90,12 +91,13 @@ static bool do_ppp_disconnect(struct mobile_adapter *adapter)
         if (s->connections[conn]) {
             mobile_cb_sock_close(adapter, conn);
             s->connections[conn] = false;
-            if (s->mail_conn[conn]) {
-                s->mail_conn[conn] = false;
-                mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_DEAUTHORIZE,
-                    s->ppp_id, s->ppp_id_size);
-            }
+            s->mail_conn[conn] = false;
         }
+    }
+    if (s->mail_authorized) {
+        s->mail_authorized = false;
+        mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_DEAUTHORIZE,
+            s->ppp_id, s->ppp_id_size);
     }
     s->state = MOBILE_CONNECTION_CALL_ISP;
     return true;
@@ -148,6 +150,8 @@ static void do_start_session(struct mobile_adapter *adapter)
     s->state = MOBILE_CONNECTION_DISCONNECTED;
     memset(s->connections, false, sizeof(s->connections));
     memset(s->mail_conn, false, sizeof(s->mail_conn));
+    s->mail_authorized = false;
+    s->pop3.state = MOBILE_POP3_AUTH_INACTIVE;
 
     mobile_number_fetch_cancel(adapter);
 }
@@ -577,6 +581,28 @@ enum procdata_data {
     PROCDATA_DATA_SENT_SIZE
 };
 
+// While the tracked POP3 connection's authentication is still being
+//   intercepted (see pop3_auth.h), route its traffic through there instead
+//   of the socket callbacks directly. Every other connection (and this one,
+//   once interception is done) is unaffected.
+static int data_sock_send(struct mobile_adapter *adapter, unsigned char conn, bool internet, const void *data, unsigned size)
+{
+    struct mobile_adapter_commands *s = &adapter->commands;
+    if (internet && s->mail_conn[conn] && !mobile_pop3_auth_done(adapter, conn)) {
+        return mobile_pop3_auth_send(adapter, conn, data, size);
+    }
+    return mobile_cb_sock_send(adapter, conn, data, size, NULL);
+}
+
+static int data_sock_recv(struct mobile_adapter *adapter, unsigned char conn, bool internet, void *data, unsigned size)
+{
+    struct mobile_adapter_commands *s = &adapter->commands;
+    if (internet && s->mail_conn[conn] && !mobile_pop3_auth_done(adapter, conn)) {
+        return mobile_pop3_auth_recv(adapter, conn, data, size);
+    }
+    return mobile_cb_sock_recv(adapter, conn, data, size, NULL);
+}
+
 // Errors:
 // 0 - Invalid connection/communication failed
 // 1 - Invalid use (Call was ended/never made)
@@ -613,8 +639,8 @@ static struct mobile_packet *command_data(struct mobile_adapter *adapter, struct
     unsigned send_size = packet->length - 1;
 
     if (send_size > sent_size) {
-        int rc = mobile_cb_sock_send(adapter, conn, data + sent_size,
-            send_size - sent_size, NULL);
+        int rc = data_sock_send(adapter, conn, internet, data + sent_size,
+            send_size - sent_size);
         if (rc < 0) {
             // A broken P2P socket isn't information a real Mobile Adapter
             // could have given the game either, same reasoning as the
@@ -641,8 +667,8 @@ static struct mobile_packet *command_data(struct mobile_adapter *adapter, struct
         }
     }
 
-    int recv_size = mobile_cb_sock_recv(adapter, conn, data,
-        MOBILE_MAX_TRANSFER_SIZE, NULL);
+    int recv_size = data_sock_recv(adapter, conn, internet, data,
+        MOBILE_MAX_TRANSFER_SIZE);
 
     if (recv_size == -2) {
         // If connected to the internet, and a disconnect is received, we
@@ -983,12 +1009,23 @@ static struct mobile_packet *command_tcp_connect_connecting(struct mobile_adapte
         }
     }
 
-    // A POP3 connection is a reliable, precise signal that the game is
-    //   about to use mail, without depending on the SMTP port rewriting
-    //   logic above. Fires a device-auth authorize event, tracking this
-    //   connection so its eventual close can fire the matching deauthorize.
-    if ((packet->data[4] << 8 | packet->data[5]) == 110) {
+    unsigned mail_port = packet->data[4] << 8 | packet->data[5];
+
+    // A POP3 connection needs line-level interception for XAPOP/XPROVISION
+    //   (see pop3_auth.h), regardless of device-auth below.
+    if (mail_port == 110) {
         s->mail_conn[conn] = true;
+        mobile_pop3_auth_start(adapter, conn);
+    }
+
+    // Fire the device-auth authorize side channel once per PPP session, on
+    //   the first connection to either mail port -- covers a game using
+    //   SMTP and POP3 in either order within the same call. The matching
+    //   deauthorize always fires on PPP disconnect, not tied to any one
+    //   connection closing, since a game may open/close mail sockets
+    //   repeatedly within a single call.
+    if ((mail_port == 25 || mail_port == 110) && !s->mail_authorized) {
+        s->mail_authorized = true;
         mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_AUTHORIZE,
             s->ppp_id, s->ppp_id_size);
     }
@@ -1049,11 +1086,7 @@ static struct mobile_packet *command_tcp_disconnect(struct mobile_adapter *adapt
     }
     mobile_cb_sock_close(adapter, conn);
     s->connections[conn] = false;
-    if (s->mail_conn[conn]) {
-        s->mail_conn[conn] = false;
-        mobile_device_auth_notify(adapter, MOBILE_DEVICE_AUTH_DEAUTHORIZE,
-            s->ppp_id, s->ppp_id_size);
-    }
+    s->mail_conn[conn] = false;
 
     packet->length = 1;
     return packet;
@@ -1083,6 +1116,7 @@ static struct mobile_packet *command_udp_disconnect(struct mobile_adapter *adapt
 
 enum process_dns_request {
     PROCESS_DNS_REQUEST_BEGIN,
+    PROCESS_DNS_REQUEST_SEND,
     PROCESS_DNS_REQUEST_CHECK
 };
 
@@ -1125,13 +1159,14 @@ static int dns_request_start(struct mobile_adapter *adapter, struct mobile_packe
     if (addr_id >= 4) return -1;
     mobile_addr_copy(&b->processing_addr, addr_send);
 
-    // Open connection and send query
+    // Open connection and build the query (sending is a separate,
+    //   retried step -- see command_dns_request_send())
     if (!mobile_cb_sock_open(adapter, conn, MOBILE_SOCKTYPE_UDP,
             b->processing_addr.type, 0)) {
         return -1;
     }
-    if (!mobile_dns_request_send(adapter, conn, &b->processing_addr,
-            (char *)packet->data, packet->length)) {
+    if (!mobile_dns_request_build(adapter, (char *)packet->data,
+            packet->length)) {
         mobile_cb_sock_close(adapter, conn);
         return -1;
     }
@@ -1176,6 +1211,31 @@ static struct mobile_packet *command_dns_request_begin(struct mobile_adapter *ad
 
     b->processing_data[PROCDATA_DNS_REQUEST_CONN] = conn;
     b->processing_data[PROCDATA_DNS_REQUEST_ADDR_ID] = addr_id;
+    b->processing = PROCESS_DNS_REQUEST_SEND;
+    return NULL;
+}
+
+static struct mobile_packet *command_dns_request_send(struct mobile_adapter *adapter, struct mobile_packet *packet)
+{
+    struct mobile_adapter_commands *s = &adapter->commands;
+    struct mobile_buffer_commands *b = &adapter->buffer.commands;
+
+    unsigned char conn = b->processing_data[PROCDATA_DNS_REQUEST_CONN];
+
+    int rc = mobile_dns_request_send(adapter, conn, &b->processing_addr);
+    if (rc == 0) {
+        if (!mobile_cb_time_check_ms(adapter, MOBILE_TIMER_COMMAND, 3000)) {
+            return NULL;
+        }
+        rc = -1;
+    }
+
+    if (rc < 0) {
+        mobile_cb_sock_close(adapter, conn);
+        s->connections[conn] = false;
+        return error_packet(packet, 2);
+    }
+
     b->processing = PROCESS_DNS_REQUEST_CHECK;
     return NULL;
 }
@@ -1205,6 +1265,7 @@ static struct mobile_packet *command_dns_request_check(struct mobile_adapter *ad
             addr_id = dns_request_start(adapter, packet, conn, 2);
             if (addr_id < 0) return error_packet(packet, 2);
             b->processing_data[PROCDATA_DNS_REQUEST_ADDR_ID] = addr_id;
+            b->processing = PROCESS_DNS_REQUEST_SEND;
             return NULL;
         }
 
@@ -1230,6 +1291,9 @@ static struct mobile_packet *command_dns_request(struct mobile_adapter *adapter,
     switch (b->processing) {
     case PROCESS_DNS_REQUEST_BEGIN:
         return command_dns_request_begin(adapter, packet);
+
+    case PROCESS_DNS_REQUEST_SEND:
+        return command_dns_request_send(adapter, packet);
 
     case PROCESS_DNS_REQUEST_CHECK:
         return command_dns_request_check(adapter, packet);

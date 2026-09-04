@@ -192,6 +192,16 @@ static void config_library_save(struct mobile_adapter *adapter)
         sizeof(buffer));
 }
 
+// How many counter values are reserved (and persisted as a single ceiling)
+//   per storage write, to bound how often device-auth requests wear
+//   flash-backed config storage. Deliberately generous relative to actual
+//   mail usage (per real MAGB game survey data, expect ~1-3 mail
+//   logins/session for the minority of games that use mail at all) --
+//   "wasting" up to this many counter values on every crash/reboot is
+//   inconsequential against a 64-bit space, so this is tuned purely for
+//   write frequency, not counter exhaustion risk.
+#define MOBILE_DEVICE_AUTH_COUNTER_BATCH 50
+
 // Layout of the device-auth extension area (MOBILE_CONFIG_SIZE_DEVICE_AUTH
 //   bytes, starting at MOBILE_CONFIG_OFFSET_DEVICE_AUTH):
 //   0x00      'D'
@@ -199,7 +209,9 @@ static void config_library_save(struct mobile_adapter *adapter)
 //   0x02      0 (version)
 //   0x03-0x04 checksum (little-endian, over everything from 0x05 onward)
 //   0x05-0x24 device_auth_key (32 bytes)
-//   0x25-0x2c device_auth_counter (uint64, little-endian)
+//   0x25-0x2c device_auth_counter_ceiling (uint64, little-endian) -- the
+//             highest counter value ever reserved, NOT the last one
+//             actually used; see mobile_config_device_auth_next().
 static bool config_device_auth_load(struct mobile_adapter *adapter)
 {
     struct mobile_adapter_config *config = &adapter->config;
@@ -232,11 +244,17 @@ static bool config_device_auth_load(struct mobile_adapter *adapter)
     memcpy(config->device_auth_key, buffer + 0x05,
         sizeof(config->device_auth_key));
 
-    uint64_t counter = 0;
+    uint64_t ceiling = 0;
     for (unsigned i = 0; i < 8; i++) {
-        counter |= (uint64_t)buffer[0x25 + i] << (8 * i);
+        ceiling |= (uint64_t)buffer[0x25 + i] << (8 * i);
     }
-    config->device_auth_counter = counter;
+    // Both start equal to the persisted ceiling: the next
+    //   mobile_config_device_auth_next() call must see counter >= ceiling
+    //   immediately, forcing a fresh reservation (and a fresh, larger
+    //   persisted ceiling) before handing out any value, so nothing at or
+    //   below what was already reserved before this boot is ever reused.
+    config->device_auth_counter = ceiling;
+    config->device_auth_counter_ceiling = ceiling;
     config->device_auth_key_init = true;
     return true;
 }
@@ -254,7 +272,7 @@ static void config_device_auth_save(struct mobile_adapter *adapter)
     memcpy(buffer + 0x05, config->device_auth_key,
         sizeof(config->device_auth_key));
     for (unsigned i = 0; i < 8; i++) {
-        buffer[0x25 + i] = (unsigned char)(config->device_auth_counter >> (8 * i));
+        buffer[0x25 + i] = (unsigned char)(config->device_auth_counter_ceiling >> (8 * i));
     }
 
     uint16_t sum = checksum(buffer + 5, sizeof(buffer) - 5);
@@ -283,21 +301,30 @@ void mobile_config_set_device_auth_key(struct mobile_adapter *adapter, const uns
 
     memcpy(config->device_auth_key, key, sizeof(config->device_auth_key));
     config->device_auth_counter = 0;
+    config->device_auth_counter_ceiling = 0;
     config->device_auth_key_init = true;
 
     config_device_auth_save(adapter);
 }
 
 // Returns the next, not-yet-used counter value to sign a device-auth
-//   request with, having already durably persisted it, so that it can never
-//   be handed out again, even if the program crashes right after this call.
+//   request with. Storage is only rewritten when the current reserved
+//   batch is exhausted (see MOBILE_DEVICE_AUTH_COUNTER_BATCH), not on every
+//   call: the persisted ceiling is always >= any value actually handed out,
+//   so a crash can only skip ahead into the next batch, never repeat one.
 bool mobile_config_device_auth_next(struct mobile_adapter *adapter, uint64_t *counter)
 {
-    if (!adapter->config.device_auth_key_init) return false;
+    struct mobile_adapter_config *config = &adapter->config;
+    if (!config->device_auth_key_init) return false;
 
-    adapter->config.device_auth_counter++;
-    *counter = adapter->config.device_auth_counter;
-    config_device_auth_save(adapter);
+    if (config->device_auth_counter >= config->device_auth_counter_ceiling) {
+        config->device_auth_counter_ceiling =
+            config->device_auth_counter + MOBILE_DEVICE_AUTH_COUNTER_BATCH;
+        config_device_auth_save(adapter);
+    }
+
+    config->device_auth_counter++;
+    *counter = config->device_auth_counter;
     return true;
 }
 
@@ -315,6 +342,7 @@ void mobile_config_init(struct mobile_adapter *adapter)
     memset(adapter->config.relay_token, 0, MOBILE_RELAY_TOKEN_SIZE);
     adapter->config.device_auth_key_init = false;
     adapter->config.device_auth_counter = 0;
+    adapter->config.device_auth_counter_ceiling = 0;
     memset(adapter->config.device_auth_key, 0, MOBILE_DEVICE_AUTH_KEY_SIZE);
 }
 

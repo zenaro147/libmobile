@@ -50,9 +50,16 @@ struct mobile_adapter_config {
     unsigned char device_auth_key[MOBILE_DEVICE_AUTH_KEY_SIZE];
 
     // Monotonically increasing counter, used to prevent replay of
-    //   device-auth requests. Persisted immediately whenever incremented, so
-    //   that no value is ever reused, even across a crash.
+    //   device-auth requests. Never reused, even across a crash: storage
+    //   only ever records a reserved ceiling (see
+    //   mobile_config_device_auth_next()), not each individual value, to
+    //   bound how often it's rewritten on wear-limited flash.
     uint64_t device_auth_counter;
+
+    // Highest counter value reserved (and persisted) so far. device_auth_counter
+    //   is only handed out up to this ceiling before storage needs to be
+    //   rewritten again to reserve a new batch.
+    uint64_t device_auth_counter_ceiling;
 };
 
 void mobile_config_init(struct mobile_adapter *adapter);

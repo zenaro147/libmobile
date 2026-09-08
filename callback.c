@@ -101,7 +101,7 @@ IMPL void mobile_impl_update_number(A_UNUSED void *user, A_UNUSED enum mobile_nu
     return;
 }
 
-IMPL void mobile_impl_update_device_auth(A_UNUSED void *user, A_UNUSED enum mobile_device_auth_action action, A_UNUSED const unsigned char *ppp_id, A_UNUSED unsigned ppp_id_size, A_UNUSED uint64_t counter, A_UNUSED const unsigned char *sig)
+IMPL void mobile_impl_update_device_auth(A_UNUSED void *user, A_UNUSED enum mobile_device_auth_action action, A_UNUSED const unsigned char *ppp_id, A_UNUSED unsigned ppp_id_size, A_UNUSED uint64_t counter, A_UNUSED const unsigned char *sig, A_UNUSED const unsigned char *addr_ipv4)
 {
     return;
 }

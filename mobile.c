@@ -218,12 +218,46 @@ enum mobile_action mobile_actions_get(struct mobile_adapter *adapter)
         actions |= MOBILE_ACTION_WRITE_CONFIG;
     }
 
-    // When we have time for it, attempt to fetch the user's number
+    // When we have time for it, attempt to fetch the user's number. Unlike
+    //   device-auth below, this is purely informational background work, so
+    //   it stays restricted to idle time between sessions (!global.active).
+    // Mutually exclusive with device-auth resolution below: both alias the
+    //   same shared dns/relay socket buffer. Once active, a fetch is left to
+    //   run to completion (device-auth won't preempt it -- see below), but a
+    //   fetch must never start fresh while a device-auth event is pending:
+    //   that event represents real, time-sensitive mail-relay authorization
+    //   and shouldn't be forced to wait out an entire fetch attempt just
+    //   because both happened to become eligible on the same tick.
     if (adapter->global.number_fetch_active || (
                 !adapter->global.active &&
+                adapter->device_auth.state == MOBILE_DEVICE_AUTH_IDLE &&
+                !adapter->device_auth.pending &&
                 adapter->global.number_fetch_retries &&
                 adapter->config.relay.type != MOBILE_ADDRTYPE_NONE)) {
         actions |= MOBILE_ACTION_INIT_NUMBER;
+    }
+
+    // Resolve/dispatch a queued device-auth event. Deliberately NOT gated on
+    //   !global.active: authorize needs to land during the PPP session,
+    //   right after the game connects to a mail port and before it starts
+    //   the actual SMTP/POP3 exchange -- waiting for the session to end
+    //   entirely would make it structurally impossible to ever dispatch an
+    //   authorize before mail traffic happens (a real bug an earlier version
+    //   of this had: the pending authorize would sit untouched for the
+    //   entire session, then get overwritten by the deauthorize that fires
+    //   on disconnect, so the relay server would see 0 authorize and 1
+    //   deauthorize per session -- exactly what production logs showed).
+    // Safe to run mid-session because mobile_device_auth_handle() borrows a
+    //   connection slot through mobile_commands_connection_new() (see
+    //   commands.h) instead of a hardcoded one, so it can never collide with
+    //   a connection the game already has open, and simply waits its turn
+    //   (staying pending, not dropped) if both slots are taken.
+    // Still mutually exclusive with number_fetch above: both alias the same
+    //   shared dns/relay socket buffer for their own protocol state.
+    if (adapter->device_auth.state != MOBILE_DEVICE_AUTH_IDLE || (
+                !adapter->global.number_fetch_active &&
+                adapter->device_auth.pending)) {
+        actions |= MOBILE_ACTION_DEVICE_AUTH;
     }
 
     return actions;
@@ -299,6 +333,12 @@ void mobile_actions_process(struct mobile_adapter *adapter, enum mobile_action a
         number_fetch_handle(adapter);
         return;
     }
+
+    // Use free time to resolve/dispatch a queued device-auth event
+    if (actions & MOBILE_ACTION_DEVICE_AUTH) {
+        mobile_device_auth_handle(adapter);
+        return;
+    }
 }
 
 void mobile_loop(struct mobile_adapter *adapter)
@@ -360,6 +400,25 @@ void mobile_stop(struct mobile_adapter *adapter)
 
     mobile_reset(adapter);
     mobile_config_save(adapter);
+
+    // Ending the session above queues a device-auth deauthorize, but
+    //   global.start is already false, so mobile_actions_get() returns
+    //   nothing and there is no tick left in which to resolve and send it.
+    //   Assume it is lost: the relay server never hears that this session
+    //   ended, and falls back to expiring the authorization on its own.
+    //   The event is left queued rather than discarded, so a frontend that
+    //   keeps this adapter around and calls mobile_start() again does still
+    //   deliver it -- but that is the exception, not something to count on.
+    //   Stopping for good is the normal case, and freeing the adapter right
+    //   after stopping (as frontends do) takes the queued event with it.
+    // Worth seeing in the log either way, since from the server's side an
+    //   event that was never dispatched looks the same as a lost request.
+    if (adapter->device_auth.pending) {
+        debug_prefix(adapter);
+        mobile_debug_print(adapter,
+            PSTR("Stopped with a device-auth event still queued"));
+        mobile_debug_endl(adapter);
+    }
 }
 
 void mobile_init(struct mobile_adapter *adapter, void *user)
@@ -373,6 +432,7 @@ void mobile_init(struct mobile_adapter *adapter, void *user)
     mobile_commands_init(adapter);
     mobile_serial_init(adapter);
     mobile_dns_init(adapter);
+    mobile_device_auth_init(adapter);
 }
 
 #define VER_MAJOR 0

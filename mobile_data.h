@@ -22,6 +22,7 @@
 #include "commands.h"
 #include "dns.h"
 #include "relay.h"
+#include "device_auth.h"
 
 struct mobile_adapter {
     void *user;
@@ -33,6 +34,7 @@ struct mobile_adapter {
     struct mobile_adapter_commands commands;
     struct mobile_adapter_dns dns;
     struct mobile_adapter_relay relay;
+    struct mobile_adapter_device_auth device_auth;
 
     // Memory shared across subsystems
     struct {

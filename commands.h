@@ -96,6 +96,18 @@ struct mobile_adapter_commands {
 void mobile_commands_init(struct mobile_adapter *adapter);
 void mobile_commands_reset(struct mobile_adapter *adapter);
 struct mobile_packet *mobile_commands_process(struct mobile_adapter *adapter, struct mobile_packet *packet);
+
+// Finds a free connection slot (0..MOBILE_MAX_CONNECTIONS-1) without
+//   reserving it, or returns -1 if none are free. The caller must set
+//   adapter->commands.connections[conn] = true once its own setup (e.g.
+//   sock_open) actually succeeds -- not before, so a failed setup doesn't
+//   leak the slot as permanently reserved -- and back to false once done
+//   with it.
+// Exposed so device_auth.c can borrow a slot for its own background socket
+//   without colliding with (or stomping) a connection the game itself
+//   already has open -- MOBILE_MAX_CONNECTIONS is small (2), so this must
+//   go through the same accounting as every other connection user.
+int mobile_commands_connection_new(struct mobile_adapter *adapter);
 bool mobile_commands_exists(enum mobile_command command);
 
 #undef _Atomic  // "atomic.h"

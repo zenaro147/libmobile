@@ -55,7 +55,8 @@ enum mobile_action {
     MOBILE_ACTION_RESET_SERIAL = 1 << 3,
     MOBILE_ACTION_CHANGE_32BIT_MODE = 1 << 4,
     MOBILE_ACTION_WRITE_CONFIG = 1 << 5,
-    MOBILE_ACTION_INIT_NUMBER = 1 << 6
+    MOBILE_ACTION_INIT_NUMBER = 1 << 6,
+    MOBILE_ACTION_DEVICE_AUTH = 1 << 7
 };
 
 enum mobile_socktype {
@@ -272,6 +273,17 @@ void mobile_def_sock_open(struct mobile_adapter *adapter, mobile_func_sock_open 
 // Closing a socket that hasn't been opened is undefined and may produce an
 // error or terminate the program, libmobile shall never do this.
 //
+// This may be called at any point, including on a socket with an operation
+// still in flight (a send that hasn't completed, or a receive that's still
+// being waited on), and not only at predictable points such as the end of a
+// session: the device-auth side channel resolves addresses in the background
+// and gives its socket back as soon as the game needs the connection slot.
+// The socket must therefore be left fully torn down, with no registration
+// still pointing at it. In particular, if the underlying stack has separate
+// calls to deregister callbacks and to free the socket, deregister first --
+// freeing first and then deregistering writes into freed memory, which tends
+// to go unnoticed while closes only ever happen at quiet moments.
+//
 // Parameters:
 // - conn: Socket number
 typedef void (*mobile_func_sock_close)(void *user, unsigned conn);
@@ -375,6 +387,24 @@ void mobile_def_sock_send(struct mobile_adapter *adapter, mobile_func_sock_send 
 // maximum amount of data to be stored in the buffer pointed to by the <data>
 // parameter. If there isn't enough data, returning less is OK.
 //
+// Note <size> caps what may be written to <data>, but nothing caps what the
+// network hands the implementation: a UDP datagram may be arbitrarily large,
+// up to the link's MTU and beyond once IP reassembly is involved, and its
+// size is chosen by the remote. An implementation that stages incoming data
+// in a buffer of its own must clamp against that buffer, not trust the
+// received length -- the remote that answers is not necessarily the DNS
+// server that was asked. Every UDP socket libmobile currently opens is for
+// a DNS lookup (the game's own DNS_REQUEST, and the device-auth side
+// channel), so in practice these datagrams are small; UDP_CONNECT, which
+// would let the game pick an arbitrary remote, is not implemented.
+//
+// On a UDP socket, a datagram larger than <size> must be truncated, with the
+// remainder discarded: a single datagram may never be split across
+// consecutive calls, since libmobile parses each result as one whole message
+// and would otherwise read the tail of one datagram as the start of the next.
+// On a TCP socket the opposite holds, as usual for a stream -- returning less
+// than is available is fine, and the rest is picked up by later calls.
+//
 // If the <addr> parameter is non-NULL, and at least one byte has been
 // received, the <struct mobile_addr> buffer pointed to by it must be filled
 // with the appropriate address. This buffer is big enough to hold the biggest
@@ -426,19 +456,25 @@ void mobile_def_update_number(struct mobile_adapter *adapter, mobile_func_update
 // mobile_func_update_device_auth - Device authorization side channel event
 //
 // This is an extension beyond the original Mobile Adapter GB protocol. It's
-// called whenever the library detects that the connected game has opened (or
-// stopped using) a POP3 connection (destination port 110) while logged in to
-// an ISP, alongside a signature that a frontend MAY use to authorize (or
-// deauthorize) this device with a compatible, cooperating mail relay server,
-// via whatever side channel that server expects (e.g. an HTTP request). This
-// has no effect on, and is entirely independent from, the emulated protocol
-// session itself.
+// called once per PPP session, when the library detects the connected game
+// has logged in to an ISP and connected to a mail port (25 or 110), and
+// again when that PPP session ends, alongside a signature that a frontend
+// MAY use to authorize (or deauthorize) this device with a compatible,
+// cooperating mail relay server, via whatever side channel that server
+// expects (e.g. an HTTP request). This has no effect on, and is entirely
+// independent from, the emulated protocol session itself.
 //
-// Frontends that don't implement such a side channel should leave this
-// callback unset, in which case it will simply never be called, as it relies
-// on a device_auth key having been provisioned through the config storage
-// first (see mobile_func_config_read). Implementing this callback must not
-// block, as it's called synchronously from within the library.
+// The library resolves the server's address itself (through the same
+// DNS1/DNS2 mechanism, and port, that the current session's own DNS lookups
+// use), so this fires asynchronously, some time after the triggering event
+// -- never mid-command. Frontends that don't implement such a side channel
+// should leave this callback unset, in which case it will simply never be
+// called, as it relies on a device_auth key having been provisioned through
+// the config storage first (see mobile_func_config_read). Implementing this
+// callback must not block, as it's called synchronously from within the
+// library. At most one event is ever in flight: a new one arriving before
+// resolution for a previous one finishes replaces it, relying on the
+// server's own TTL as a backstop for whatever was dropped this way.
 //
 // Parameters:
 // - action: whether this is an authorization or deauthorization event
@@ -446,11 +482,24 @@ void mobile_def_update_number(struct mobile_adapter *adapter, mobile_func_update
 //   byte string that is NOT null-terminated
 // - ppp_id_size: length of ppp_id, at most 0x20
 // - counter: value that must be included, as its decimal representation
-//   without leading zeros, in the message that was signed to produce <sig>
+//   without leading zeros, in the message that was signed to produce <sig>.
+//   It is strictly increasing and never reused, so a server may reject any
+//   value it has already seen -- but it is NOT contiguous, and a verifier
+//   must accept gaps. To avoid rewriting config storage on every single
+//   request (which would wear out flash on embedded targets), values are
+//   handed out from a batch reserved ahead of time, and only the reserved
+//   ceiling is persisted; on the next power-up the unused remainder of that
+//   batch is skipped rather than reissued. Losing power mid-batch therefore
+//   jumps the counter forward, by up to the batch size. A verifier that
+//   requires the next value to be exactly one higher will reject every
+//   request made after a power cycle
 // - sig: raw MOBILE_DEVICE_AUTH_SIG_SIZE-byte HMAC-SHA256 signature, that a
 //   cooperating server can verify to trust this request
-typedef void (*mobile_func_update_device_auth)(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig);
-void mobile_impl_update_device_auth(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig);
+// - addr_ipv4: the device-auth server's resolved address, MOBILE_HOSTLEN_IPV4
+//   bytes -- frontends never need to know its hostname or resolve it
+//   themselves
+typedef void (*mobile_func_update_device_auth)(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4);
+void mobile_impl_update_device_auth(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4);
 void mobile_def_update_device_auth(struct mobile_adapter *adapter, mobile_func_update_device_auth func);
 
 void mobile_config_set_device(struct mobile_adapter *adapter, enum mobile_adapter_device device, bool unmetered);
@@ -624,6 +673,18 @@ void mobile_start(struct mobile_adapter *adapter);
 // It's recommended to call this function before ending the program execution,
 // but it may also be used to temporarily pause the library, before calling
 // mobile_start() again.
+//
+// Those two uses differ in one respect worth knowing about. Ending the
+// session, which this does, may queue a device-auth deauthorize (see
+// mobile_func_update_device_auth), and that event still needs later
+// mobile_loop() calls to resolve an address and be dispatched. By then the
+// library is stopped and no longer does anything, so the event only ever goes
+// out in the pause case, once mobile_start() is called again on the same
+// adapter. Stopping for good never delivers it -- nor does freeing the
+// adapter afterwards, or a device that simply powers off without calling this
+// at all -- and the relay server is left to expire the authorization on its
+// own. Either way the debug log records that an event was left queued, since
+// the library cannot tell at this point which case it is in.
 //
 // Parameters:
 // - adapter: Library state

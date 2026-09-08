@@ -68,15 +68,30 @@ static struct mobile_packet *error_packet(struct mobile_packet *packet, unsigned
     return packet;
 }
 
-static int connection_new(struct mobile_adapter *adapter)
+int mobile_commands_connection_new(struct mobile_adapter *adapter)
 {
     struct mobile_adapter_commands *s = &adapter->commands;
 
-    // Find a free connection slot
+    // Find a free connection slot. Doesn't mark it used -- same contract as
+    //   before this was exposed: the caller does that once its own setup
+    //   (sock_open, ...) actually succeeds, so a failed setup doesn't leak
+    //   the slot as permanently reserved.
     unsigned char conn;
     for (conn = 0; conn < MOBILE_MAX_CONNECTIONS; conn++) {
         if (!s->connections[conn]) break;
     }
+
+    // With none free, reclaim one from the device-auth side channel if it
+    //   happens to be holding it. The game must never be denied a
+    //   connection because of a background task it can't observe -- it
+    //   fails hard (error_packet) where device-auth simply retries later.
+    if (conn >= MOBILE_MAX_CONNECTIONS) {
+        mobile_device_auth_cancel(adapter);
+        for (conn = 0; conn < MOBILE_MAX_CONNECTIONS; conn++) {
+            if (!s->connections[conn]) break;
+        }
+    }
+
     if (conn >= MOBILE_MAX_CONNECTIONS) return -1;
     return conn;
 }
@@ -87,6 +102,15 @@ static bool do_ppp_disconnect(struct mobile_adapter *adapter)
 
     // Clean up internet connections if connected to the internet
     if (s->state != MOBILE_CONNECTION_INTERNET) return false;
+
+    // Hand back the device-auth socket first, if it's mid-resolution. The
+    //   loop below closes anything connections[] marks as used, which since
+    //   device-auth started running mid-session includes a slot it may be
+    //   holding -- closing it here would leave device-auth using a closed
+    //   socket and then closing it a second time, both of which this
+    //   library promises never to do (see mobile_func_sock_close).
+    mobile_device_auth_cancel(adapter);
+
     for (unsigned char conn = 0; conn < MOBILE_MAX_CONNECTIONS; conn++) {
         if (s->connections[conn]) {
             mobile_cb_sock_close(adapter, conn);
@@ -118,6 +142,11 @@ static bool do_offline(struct mobile_adapter *adapter)
 
     mobile_cb_update_number(adapter, MOBILE_NUMBER_PEER, NULL);
 
+    // Same reason as in do_ppp_disconnect(), which may have returned early
+    //   above without reaching its own call: device-auth could be holding
+    //   this very slot.
+    mobile_device_auth_cancel(adapter);
+
     // Clean up p2p connections if in a call
     if (s->connections[p2p_conn]) {
         mobile_cb_sock_close(adapter, p2p_conn);
@@ -134,6 +163,9 @@ static void do_end_session(struct mobile_adapter *adapter)
 
     struct mobile_adapter_commands *s = &adapter->commands;
 
+    // As above: neither call before this one is guaranteed to have run.
+    mobile_device_auth_cancel(adapter);
+
     // Clean up a possibly residual connection that wasn't established by
     //   the command_wait_call function
     if (s->connections[p2p_conn]) mobile_cb_sock_close(adapter, p2p_conn);
@@ -148,6 +180,11 @@ static void do_start_session(struct mobile_adapter *adapter)
 
     s->session_started = true;
     s->state = MOBILE_CONNECTION_DISCONNECTED;
+
+    // The memset below declares every slot free, so anything device-auth is
+    //   holding has to be given back first, or it'd be handed out twice.
+    mobile_device_auth_cancel(adapter);
+
     memset(s->connections, false, sizeof(s->connections));
     memset(s->mail_conn, false, sizeof(s->mail_conn));
     s->mail_authorized = false;
@@ -937,7 +974,7 @@ static struct mobile_packet *command_tcp_connect_begin(struct mobile_adapter *ad
     }
     if (packet->length < 6) return error_packet(packet, 3);
 
-    int conn = connection_new(adapter);
+    int conn = mobile_commands_connection_new(adapter);
     if (conn < 0) return error_packet(packet, 0);
 
     if (!mobile_cb_sock_open(adapter, conn, MOBILE_SOCKTYPE_TCP,
@@ -1203,7 +1240,7 @@ static struct mobile_packet *command_dns_request_begin(struct mobile_adapter *ad
         return packet;
     }
 
-    int conn = connection_new(adapter);
+    int conn = mobile_commands_connection_new(adapter);
     if (conn < 0) return error_packet(packet, 2);
 
     int addr_id = dns_request_start(adapter, packet, conn, 0);

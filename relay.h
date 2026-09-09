@@ -4,7 +4,7 @@
 struct mobile_adapter;
 struct mobile_addr;
 
-#define MOBILE_RELAY_PACKET_SIZE 0x20
+#define MOBILE_RELAY_PACKET_SIZE 0x30
 
 enum mobile_relay_command {
     MOBILE_RELAY_COMMAND_CALL,

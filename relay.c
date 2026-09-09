@@ -20,7 +20,8 @@
 // assigned number across multiple connections and application restarts. The
 // phone numbers are expected to be exchanged between users.
 
-#define PROTOCOL_VERSION 0
+// Version 1 adds the device id to the handshake; see relay_handshake_build().
+#define PROTOCOL_VERSION 1
 
 // Maximum number size
 #define MOBILE_RELAY_MAX_NUMBER_SIZE 16
@@ -28,11 +29,11 @@ static_assert(MOBILE_MAX_NUMBER_SIZE >= MOBILE_RELAY_MAX_NUMBER_SIZE,
     "MOBILE_MAX_NUMBER_SIZE isn't big enough!");
 
 // Maximum packet sizes
-//#define MAX_HANDSHAKE_SIZE (7 + 1 + MOBILE_RELAY_TOKEN_SIZE)  // 24
+//#define MAX_HANDSHAKE_SIZE (7 + 1 + MOBILE_RELAY_TOKEN_SIZE + 1 + MOBILE_DEVICE_ID_SIZE)  // 33
 //#define MAX_COMMAND_CALL_SIZE (3 + MOBILE_RELAY_MAX_NUMBER_SIZE)  // 19
 //#define MAX_COMMAND_WAIT_SIZE (4 + MOBILE_RELAY_MAX_NUMBER_SIZE)  // 20
 //#define MAX_COMMAND_GET_NUMBER_SIZE (3 + MOBILE_RELAY_MAX_NUMBER_SIZE)  // 19
-static_assert(MOBILE_RELAY_PACKET_SIZE >= 24,
+static_assert(MOBILE_RELAY_PACKET_SIZE >= 7 + 1 + MOBILE_RELAY_TOKEN_SIZE + 1 + MOBILE_DEVICE_ID_SIZE,
     "MOBILE_RELAY_PACKET_SIZE isn't big enough!");
 
 static const unsigned char handshake_magic[] PROGMEM = {
@@ -121,6 +122,22 @@ static void relay_handshake_send_debug(struct mobile_adapter *adapter)
     mobile_debug_endl(adapter);
 }
 
+// Handshake, version 1:
+//   [version]"MOBILE" has_token(1) [token(16)] has_device(1) [device(8)]
+//
+// The device id is the same one device-auth sends as `device=`, in its raw
+//   8 bytes. It lets the relay refuse a device its account's owner has
+//   blocked on the server -- the only place that can happen for a session
+//   that is P2P from the start, since without an ISP login there is no
+//   ppp_id to sign a device-auth query with, so the core has no way to
+//   learn it is blocked on its own.
+// It is NOT signed, and signing it would add nothing: the token already
+//   proves the account, and whoever holds the device holds the config with
+//   the account's key in it, so could sign whatever id they liked. The id
+//   is a label within the account, and blocking on it is cooperative, like
+//   the rest of device-auth -- the owner's own devices honouring the
+//   owner's wish. Against a device that won't cooperate, the answer is a
+//   new password and revoking everything, which the server provides.
 static void relay_handshake_build(struct mobile_adapter *adapter)
 {
     struct mobile_buffer_relay *b = &adapter->buffer.relay;
@@ -131,6 +148,18 @@ static void relay_handshake_build(struct mobile_adapter *adapter)
     unsigned char *auth = b->data + sizeof(handshake_magic);
     auth[0] = mobile_config_get_relay_token(adapter, auth + 1);
     if (auth[0]) size += MOBILE_RELAY_TOKEN_SIZE;
+
+    // Asked for fresh here rather than assumed from earlier: a frontend
+    //   that had no identity when this adapter started may have one by the
+    //   time it talks to the relay (see device_auth_device_id()).
+    unsigned char *dev = b->data + size;
+    const unsigned char *id = mobile_device_auth_device_id_raw(adapter);
+    dev[0] = id ? 1 : 0;
+    size += 1;
+    if (id) {
+        memcpy(dev + 1, id, MOBILE_DEVICE_ID_SIZE);
+        size += MOBILE_DEVICE_ID_SIZE;
+    }
 
     b->send_size = size;
 }
@@ -421,8 +450,20 @@ int mobile_relay_connect(struct mobile_adapter *adapter, unsigned char conn, con
         rc = relay_handshake_recv(adapter, conn);
         if (rc == 0) return 0;
         if (rc < 0) {
+            // A version-1 relay that refuses us sends one byte of reason
+            //   before closing: 0x01 invalid token, 0x02 device blocked.
+            //   Best effort -- if the close beat the byte, or the relay is
+            //   older, we simply won't have it. Log only: this byte is not
+            //   authenticated, so it must never set the block state that
+            //   refuses the game's own traffic (see
+            //   mobile_device_auth_block_state); only the signed query may.
+            struct mobile_buffer_relay *b = &adapter->buffer.relay;
             debug_prefix(adapter);
-            mobile_debug_print(adapter, PSTR("Authentication failed"));
+            if (b->size == 1 && b->data[0] == 0x02) {
+                mobile_debug_print(adapter, PSTR("Refused: device blocked on the site"));
+            } else {
+                mobile_debug_print(adapter, PSTR("Authentication failed"));
+            }
             mobile_debug_endl(adapter);
             s->state = MOBILE_RELAY_DISCONNECTED;
             return -1;

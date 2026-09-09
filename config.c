@@ -328,6 +328,30 @@ bool mobile_config_device_auth_next(struct mobile_adapter *adapter, uint64_t *co
     return true;
 }
 
+bool mobile_config_device_auth_catch_up(struct mobile_adapter *adapter, uint64_t last_accepted)
+{
+    struct mobile_adapter_config *config = &adapter->config;
+    if (!config->device_auth_key_init) return false;
+
+    // Forward only. Everything this counter protects rests on never handing
+    //   out a value twice, and the answer being caught up to arrives over
+    //   the network -- so treat anything not strictly ahead of what is
+    //   already reserved as nothing to do, rather than trusting it.
+    if (last_accepted < config->device_auth_counter_ceiling) return false;
+    if (last_accepted == config->device_auth_counter_ceiling &&
+            last_accepted == config->device_auth_counter) {
+        return false;
+    }
+
+    // Both, so the next mobile_config_device_auth_next() sees an exhausted
+    //   batch, reserves a fresh one past this point, and hands out
+    //   last_accepted + 1.
+    config->device_auth_counter = last_accepted;
+    config->device_auth_counter_ceiling = last_accepted;
+    config_device_auth_save(adapter);
+    return true;
+}
+
 void mobile_config_init(struct mobile_adapter *adapter)
 {
     adapter->config.loaded = false;

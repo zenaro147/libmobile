@@ -66,4 +66,12 @@ void mobile_config_init(struct mobile_adapter *adapter);
 void mobile_config_set_relay_token_internal(struct mobile_adapter *adapter, const unsigned char *token);
 bool mobile_config_device_auth_next(struct mobile_adapter *adapter, uint64_t *counter);
 
+// Catches the counter up to <last_accepted>, the highest value a server says
+//   it has already taken from this device, so the next one handed out is
+//   last_accepted + 1. Only ever moves forward: a value at or below what is
+//   already reserved is ignored, so a stale or replayed answer cannot rewind
+//   the counter and cause requests to be rejected as replays.
+// Returns whether the counter actually moved.
+bool mobile_config_device_auth_catch_up(struct mobile_adapter *adapter, uint64_t last_accepted);
+
 #undef _Atomic  // "atomic.h"

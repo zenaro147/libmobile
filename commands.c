@@ -315,6 +315,16 @@ static struct mobile_packet *command_tel_begin(struct mobile_adapter *adapter, s
 
     // If the relay is enabled, start the connection
     if (adapter->config.relay.type != MOBILE_ADDRTYPE_NONE) {
+        // Blocked on the server this session: the relay would refuse the
+        //   handshake anyway, so fail the same way a failed connection
+        //   does. Only reaches here once the block is already known, i.e.
+        //   after an ISP login in this session; a session that is P2P from
+        //   the start has no way to know, and is refused by the relay
+        //   itself (see relay_handshake_build()).
+        if (mobile_device_auth_block_state(adapter) == MOBILE_DEVICE_AUTH_BLOCK_YES) {
+            return error_packet(packet, 3);
+        }
+
         mobile_addr_copy(&b->processing_addr, &adapter->config.relay);
         mobile_relay_init(adapter);
 
@@ -473,6 +483,11 @@ static struct mobile_packet *command_wait_call_begin(struct mobile_adapter *adap
     s->state = MOBILE_CONNECTION_WAIT_TIMEOUT;
 
     if (adapter->config.relay.type != MOBILE_ADDRTYPE_NONE) {
+        // As for TEL: a device the server has blocked doesn't wait for calls.
+        if (mobile_device_auth_block_state(adapter) == MOBILE_DEVICE_AUTH_BLOCK_YES) {
+            return error_packet(packet, 0);
+        }
+
         mobile_addr_copy(&b->processing_addr, &adapter->config.relay);
         mobile_relay_init(adapter);
 
@@ -934,6 +949,11 @@ static struct mobile_packet *command_ppp_connect(struct mobile_adapter *adapter,
     s->dns2_use = 0;
     s->state = MOBILE_CONNECTION_INTERNET;
 
+    // Online now, and the ppp_id above is what device-auth signs with: ask
+    //   the server where our counter stands before anything needs
+    //   authorizing, rather than finding out from a rejection later.
+    mobile_device_auth_session_start(adapter);
+
     // Return 3 IP addresses, the phone's IP, and the chosen DNS servers.
     static const unsigned char ip_local[] = {127, 0, 0, 1};
     memcpy(packet->data + 0, ip_local, MOBILE_HOSTLEN_IPV4);  // Phone's IP
@@ -973,6 +993,13 @@ static struct mobile_packet *command_tcp_connect_begin(struct mobile_adapter *ad
         return error_packet(packet, 1);
     }
     if (packet->length < 6) return error_packet(packet, 3);
+
+    // The account's owner blocked this device on the server: the same
+    //   "connection failed" the game gets with no network, so its own
+    //   error screen shows. See mobile_device_auth_block_state().
+    if (mobile_device_auth_block_state(adapter) == MOBILE_DEVICE_AUTH_BLOCK_YES) {
+        return error_packet(packet, 3);
+    }
 
     int conn = mobile_commands_connection_new(adapter);
     if (conn < 0) return error_packet(packet, 0);
@@ -1196,6 +1223,14 @@ static int dns_request_start(struct mobile_adapter *adapter, struct mobile_packe
     if (addr_id >= 4) return -1;
     mobile_addr_copy(&b->processing_addr, addr_send);
 
+    // The query is built into adapter->buffer.dns, of which there is exactly
+    //   one, shared with the device-auth side channel's own lookups. Building
+    //   here while device-auth is mid-resolution would overwrite the query it
+    //   is waiting on a reply for -- its id included -- so it would then
+    //   reject its own answer. Same rule as the connection slot: the game's
+    //   request wins, device-auth stays queued and tries again after.
+    mobile_device_auth_cancel(adapter);
+
     // Open connection and build the query (sending is a separate,
     //   retried step -- see command_dns_request_send())
     if (!mobile_cb_sock_open(adapter, conn, MOBILE_SOCKTYPE_UDP,
@@ -1238,6 +1273,11 @@ static struct mobile_packet *command_dns_request_begin(struct mobile_adapter *ad
         memcpy(packet->data, ip, sizeof(ip));
         packet->length = 4;
         return packet;
+    }
+
+    // As for TCP_CONNECT: a blocked device gets the ordinary lookup failure.
+    if (mobile_device_auth_block_state(adapter) == MOBILE_DEVICE_AUTH_BLOCK_YES) {
+        return error_packet(packet, 2);
     }
 
     int conn = mobile_commands_connection_new(adapter);

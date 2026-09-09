@@ -60,6 +60,50 @@ struct mobile_adapter_device_auth {
     unsigned char addr_id;
     struct mobile_addr addr;
 
+    // This device's id, derived once from whatever the frontend's
+    //   mobile_func_device_identity callback hands over, and cached because
+    //   that callback may do real work (reading a MAC, a machine id) and the
+    //   answer cannot change while running. Empty string when the frontend
+    //   set no callback, or offered nothing: the id is then left out of both
+    //   the signed message and the callback, which is the older wire format.
+    char device_id[MOBILE_DEVICE_ID_STR_SIZE];
+    unsigned char device_id_raw[MOBILE_DEVICE_ID_SIZE];
+    bool device_id_init;  // set only once an id was actually derived
+
+    // Name of the frontend, mixed into the device id so two frontends on one
+    //   machine, which the operating system identifies identically, don't
+    //   derive the same one. Empty means no identity is claimed at all.
+    char impl_name[MOBILE_IMPL_NAME_MAX_SIZE + 1];
+
+    // The server's address, resolved once as soon as there is a key and a
+    //   DNS server to ask, then kept in memory for as long as this adapter
+    //   lives -- never written to config storage. Same idea as negotiating
+    //   the relay token up front: by the time an event needs sending, the
+    //   address is already known, so nothing puts a DNS round trip in front
+    //   of an authorize, and nothing contends for the shared DNS buffer
+    //   mid-session.
+    unsigned char addr_ipv4[MOBILE_HOSTLEN_IPV4];
+    bool addr_resolved;
+
+    // Set once a lookup made purely to get ahead has failed, so it isn't
+    //   retried every idle tick forever. Cleared when a session starts,
+    //   which is both a reason to try again and the moment a DNS server the
+    //   game supplied becomes available.
+    bool addr_failed;
+
+    // A counter query is wanted for this session, or has been handed to the
+    //   frontend and is waiting on mobile_device_auth_query_result(). The
+    //   counter it went out with is kept to match against the echo in the
+    //   answer: an answer echoing anything else is not the answer to this
+    //   query, however well it is signed.
+    bool query_pending;
+    bool query_inflight;
+    uint64_t query_counter;
+
+    // What the server said about blocking, this session. Never persisted;
+    //   see mobile_device_auth_block_state().
+    enum mobile_device_auth_block_state block_state;
+
     // The connection slot borrowed from mobile_commands_connection_new()
     //   for the current attempt (valid only while state != IDLE), held for
     //   the whole attempt including any DNS1->DNS2 fallback, and released
@@ -69,6 +113,20 @@ struct mobile_adapter_device_auth {
 };
 
 void mobile_device_auth_init(struct mobile_adapter *adapter);
+
+// Starts a new session: drops the cached server address, so it is resolved
+//   again, and asks for a counter query before anything is authorized.
+void mobile_device_auth_session_start(struct mobile_adapter *adapter);
+
+// Stores the frontend's name for the device id derivation. Set through
+//   mobile_def_device_identity(), which takes it alongside the callback so
+//   the two cannot be registered apart.
+void mobile_device_auth_set_impl_name(struct mobile_adapter *adapter, const char *impl_name);
+
+// The device id as the MOBILE_DEVICE_ID_SIZE raw bytes the hex form renders,
+//   for protocols that carry it in binary (the relay handshake). NULL when
+//   this device has no id -- same condition as the public getters.
+const unsigned char *mobile_device_auth_device_id_raw(struct mobile_adapter *adapter);
 
 // Queues a device-auth event for signing and dispatch through
 //   mobile_func_update_device_auth, once the server's address has been

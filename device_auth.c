@@ -17,9 +17,14 @@
 static const char device_auth_host[] = "device.auth.dion.ne.jp";
 #define DEVICE_AUTH_HOST_LEN (sizeof(device_auth_host) - 1)
 
-// Longest possible "ppp_id|action|counter" message:
-//   0x20 (ppp_id) + 1 ('|') + 11 ("deauthorize") + 1 ('|') + 20 (2^64-1)
-#define MESSAGE_MAX_SIZE (0x20 + 1 + 11 + 1 + 20)
+// Longest signed message, "ppp_id|device|query-response|<value>|<echo>":
+//   0x20 (ppp_id) + 1 + 16 (device id) + 1 + 14 ("query-response", the
+//   longest action word) + 1 + 20 (a 2^64-1 counter, or "blocked", which
+//   is shorter) + 1 + 20 (the echo). Every other message is a prefix of
+//   this shape or shorter, so this bounds them all.
+#define ACTION_MAX_LEN 14
+#define MESSAGE_MAX_SIZE \
+    (0x20 + 1 + (MOBILE_DEVICE_ID_SIZE * 2) + 1 + ACTION_MAX_LEN + 1 + 20 + 1 + 20)
 
 static void debug_prefix(struct mobile_adapter *adapter)
 {
@@ -65,6 +70,165 @@ void mobile_device_auth_init(struct mobile_adapter *adapter)
 {
     adapter->device_auth.state = MOBILE_DEVICE_AUTH_IDLE;
     adapter->device_auth.pending = false;
+    adapter->device_auth.device_id[0] = '\0';
+    adapter->device_auth.device_id_init = false;
+    adapter->device_auth.impl_name[0] = '\0';
+    adapter->device_auth.addr_resolved = false;
+    adapter->device_auth.addr_failed = false;
+    adapter->device_auth.query_pending = false;
+    adapter->device_auth.query_inflight = false;
+    adapter->device_auth.block_state = MOBILE_DEVICE_AUTH_BLOCK_UNKNOWN;
+}
+
+void mobile_device_auth_session_start(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+
+    // The resolved address deliberately survives: it belongs to the device's
+    //   run, not to one session. A failed attempt does not: a session brings
+    //   a DNS server the game chose, which the earlier try never had.
+    s->addr_failed = false;
+    s->query_inflight = false;
+    s->query_pending = adapter->config.device_auth_key_init;
+    // Learned afresh each session, on purpose; see mobile_device_auth_block_state().
+    s->block_state = MOBILE_DEVICE_AUTH_BLOCK_UNKNOWN;
+}
+
+enum mobile_device_auth_block_state mobile_device_auth_block_state(struct mobile_adapter *adapter)
+{
+    return adapter->device_auth.block_state;
+}
+
+void mobile_device_auth_set_impl_name(struct mobile_adapter *adapter, const char *impl_name)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+
+    unsigned len = 0;
+    if (impl_name) {
+        while (impl_name[len] && len < MOBILE_IMPL_NAME_MAX_SIZE) {
+            s->impl_name[len] = impl_name[len];
+            len++;
+        }
+    }
+    s->impl_name[len] = '\0';
+
+    // The id may already have been derived; the next caller must derive it
+    //   again rather than keep one built without this name.
+    s->device_id_init = false;
+    s->device_id[0] = '\0';
+}
+
+// Builds "ppp_id|device|action" (or "ppp_id|action" without a device id),
+//   the common prefix of every signed device-auth message. Returns its
+//   length; the caller appends whatever else that message carries.
+static unsigned device_auth_message_prefix(unsigned char *message, const unsigned char *ppp_id, unsigned ppp_id_size, const char *device, const char *action)
+{
+    unsigned pos = 0;
+    memcpy(message + pos, ppp_id, ppp_id_size);
+    pos += ppp_id_size;
+    message[pos++] = '|';
+    if (device) {
+        memcpy(message + pos, device, MOBILE_DEVICE_ID_SIZE * 2);
+        pos += MOBILE_DEVICE_ID_SIZE * 2;
+        message[pos++] = '|';
+    }
+    unsigned action_len = (unsigned)strlen(action);
+    memcpy(message + pos, action, action_len);
+    pos += action_len;
+    return pos;
+}
+
+// Derives this device's id from the frontend's identity bytes, hashing them
+//   so nothing the frontend considers identifying (a MAC, a machine id, a
+//   host name) is ever put on the wire as-is. Computed once and cached;
+//   returns NULL when the frontend offers no identity, which selects the
+//   older, device-less form of the message.
+static const char *device_auth_device_id(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+    if (s->device_id_init) return s->device_id;
+
+    // Without a name there is nothing to tell this frontend from another on
+    //   the same machine, and two frontends claiming one id is worse than
+    //   neither claiming any: the server would read one's requests as
+    //   replays of the other's.
+    if (s->impl_name[0] == '\0') return NULL;
+
+    // Only success is remembered. A frontend may have nothing to offer yet
+    //   and something later -- on the 3DS the Wi-Fi MAC is unreadable until
+    //   the network is up, which can be after the first thing here that
+    //   wants an id -- so "no identity" is asked again every time rather
+    //   than settled once, and the frontend needn't retry on its own.
+    unsigned char identity[MOBILE_DEVICE_IDENTITY_MAX_SIZE];
+    unsigned size = mobile_cb_device_identity(adapter, identity,
+        sizeof(identity));
+    if (size == 0 || size > sizeof(identity)) return NULL;
+
+    // sha256(impl_name || 0 || identity). Without the separator ("ab", "cd")
+    //   and ("a", "bcd") would hash alike; with it, no two pairs can.
+    // That holds because impl_name is a C string and so cannot contain a
+    //   zero, which puts the first zero of the concatenation at the length
+    //   of the name in every case -- so equal hashes mean equal names and
+    //   equal identities. Note the guarantee rests on the NAME, not on the
+    //   identity: identity is raw bytes and may well contain zeros (a board
+    //   id often does), which is harmless. Worth knowing before anyone
+    //   "fixes" this, since binary identity is the first thing that looks
+    //   like it should break it.
+    unsigned char digest[MOBILE_SHA256_SIZE];
+    struct mobile_sha256 ctx;
+    mobile_sha256_init(&ctx);
+    mobile_sha256_update(&ctx, s->impl_name, strlen(s->impl_name));
+    mobile_sha256_update(&ctx, "", 1);
+    mobile_sha256_update(&ctx, identity, size);
+    mobile_sha256_final(&ctx, digest);
+
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < MOBILE_DEVICE_ID_SIZE; i++) {
+        s->device_id_raw[i] = digest[i];
+        s->device_id[i * 2] = hex[digest[i] >> 4];
+        s->device_id[i * 2 + 1] = hex[digest[i] & 0xF];
+    }
+    s->device_id[MOBILE_DEVICE_ID_SIZE * 2] = '\0';
+    s->device_id_init = true;
+
+    debug_prefix(adapter);
+    mobile_debug_print(adapter, PSTR("Device id "));
+    mobile_debug_write(adapter, s->device_id, MOBILE_DEVICE_ID_SIZE * 2);
+    mobile_debug_endl(adapter);
+
+    return s->device_id;
+}
+
+const unsigned char *mobile_device_auth_device_id_raw(struct mobile_adapter *adapter)
+{
+    if (!device_auth_device_id(adapter)) return NULL;
+    return adapter->device_auth.device_id_raw;
+}
+
+bool mobile_device_auth_get_id(struct mobile_adapter *adapter, char *buf)
+{
+    const char *id = device_auth_device_id(adapter);
+    if (!id) return false;
+
+    memcpy(buf, id, MOBILE_DEVICE_ID_STR_SIZE);
+    return true;
+}
+
+bool mobile_device_auth_get_pairing_code(struct mobile_adapter *adapter, char *buf)
+{
+    const char *id = device_auth_device_id(adapter);
+    if (!id) return false;
+
+    // First half of the id as XXXX-XXXX, upper case.
+    for (unsigned i = 0; i < 8; i++) {
+        char c = id[i];
+        buf[i < 4 ? i : i + 1] = (c >= 'a' && c <= 'f') ? (char)(c - 'a' + 'A') : c;
+    }
+    buf[4] = '-';
+    buf[9] = '\0';
+    static_assert(MOBILE_PAIRING_CODE_STR_SIZE == 10,
+        "pairing code buffer size is out of sync with its format");
+    return true;
 }
 
 void mobile_device_auth_notify(struct mobile_adapter *adapter, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size)
@@ -122,16 +286,15 @@ static void device_auth_sign_and_dispatch(struct mobile_adapter *adapter, const 
 
     const char *action_name = s->pending_action == MOBILE_DEVICE_AUTH_AUTHORIZE ?
         "authorize" : "deauthorize";
-    unsigned action_len = (unsigned)strlen(action_name);
+
+    // "ppp_id|device|action|counter", or "ppp_id|action|counter" when this
+    //   device has no id to give. The device field sits where it does so a
+    //   server can tell the two forms apart without ambiguity.
+    const char *device = device_auth_device_id(adapter);
 
     unsigned char message[MESSAGE_MAX_SIZE];
-    unsigned pos = 0;
-
-    memcpy(message + pos, s->pending_ppp_id, s->pending_ppp_id_size);
-    pos += s->pending_ppp_id_size;
-    message[pos++] = '|';
-    memcpy(message + pos, action_name, action_len);
-    pos += action_len;
+    unsigned pos = device_auth_message_prefix(message, s->pending_ppp_id,
+        s->pending_ppp_id_size, device, action_name);
     message[pos++] = '|';
     pos += counter_to_decimal(counter, message + pos);
 
@@ -141,7 +304,213 @@ static void device_auth_sign_and_dispatch(struct mobile_adapter *adapter, const 
     static_assert(MOBILE_SHA256_SIZE == MOBILE_DEVICE_AUTH_SIG_SIZE,
         "device-auth signature size mismatch");
     mobile_cb_update_device_auth(adapter, s->pending_action,
-        s->pending_ppp_id, s->pending_ppp_id_size, counter, sig, addr_ipv4);
+        s->pending_ppp_id, s->pending_ppp_id_size, counter, sig, addr_ipv4,
+        device);
+}
+
+// Signs and hands the frontend a counter query. Returns whether it was
+//   taken; if not, the session simply proceeds on the counter it has.
+static bool device_auth_dispatch_query(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+    struct mobile_adapter_commands *c = &adapter->commands;
+
+    if (c->ppp_id_size == 0 || c->ppp_id_size > 0x20) return false;
+
+    unsigned char key[MOBILE_DEVICE_AUTH_KEY_SIZE];
+    if (!mobile_config_get_device_auth_key(adapter, key)) return false;
+
+    // Spend a counter value on the query, as an authorization would. The
+    //   server echoes it inside its signed answer, which is what makes the
+    //   answer provably a reply to THIS query and not a recording of an
+    //   earlier one. It has to come from the never-reused sequence rather
+    //   than from anything about the device's state, because the case that
+    //   matters most -- a device the server has blocked -- is exactly the
+    //   case where nothing else about the device changes between sessions.
+    uint64_t counter;
+    if (!mobile_config_device_auth_next(adapter, &counter)) return false;
+
+    const char *device = device_auth_device_id(adapter);
+
+    unsigned char message[MESSAGE_MAX_SIZE];
+    unsigned pos = device_auth_message_prefix(message, c->ppp_id,
+        c->ppp_id_size, device, "query");
+    message[pos++] = '|';
+    pos += counter_to_decimal(counter, message + pos);
+
+    unsigned char sig[MOBILE_SHA256_SIZE];
+    mobile_hmac_sha256(key, sizeof(key), message, pos, sig);
+
+    if (!mobile_cb_device_auth_query(adapter, s->addr_ipv4, c->ppp_id,
+            c->ppp_id_size, counter, sig, device)) {
+        return false;
+    }
+    s->query_counter = counter;
+
+    debug_prefix(adapter);
+    mobile_debug_print(adapter, PSTR("Asking the server for our counter"));
+    mobile_debug_endl(adapter);
+    return true;
+}
+
+// Reads one decimal field: 1-20 digits, no leading zero, no overflow.
+//   Returns how many characters it took, 0 if the text isn't one.
+static unsigned device_auth_parse_decimal(const unsigned char *p, unsigned size, uint64_t *out)
+{
+    unsigned n = 0;
+    uint64_t value = 0;
+    while (n < size && p[n] >= '0' && p[n] <= '9') {
+        if (value > (UINT64_MAX - (uint64_t)(p[n] - '0')) / 10) return 0;
+        value = value * 10 + (uint64_t)(p[n] - '0');
+        n++;
+    }
+    if (n == 0 || n > 20) return 0;
+    if (n > 1 && p[0] == '0') return 0;
+    *out = value;
+    return n;
+}
+
+// Pulls the fields out of a query response body, or reports that the body
+//   isn't one. Split out so every way of failing gets logged in one place:
+//   silently discarding an answer leaves nothing to tell "the server said
+//   something unexpected" apart from "the server never answered".
+// Body is exactly "<counter> <echo> <sig>" or "blocked <echo> <sig>": each
+//   number 1-20 digits without a leading zero, single spaces, 64 lowercase
+//   hex, and nothing else. Anything else is discarded rather than salvaged
+//   -- this sets a counter, and a bad one strands the device.
+// Trailing CR/LF is the exception, and only because it is the one
+//   difference a server can add without meaning to (an echo with a
+//   newline, a proxy being helpful) and the one that costs nothing to
+//   accept: the signature covers the fields, not the framing around them.
+static bool device_auth_parse_answer(const void *data, unsigned size, bool *blocked, uint64_t *counter, uint64_t *echo, const unsigned char **sig_hex)
+{
+    const unsigned char *body = data;
+    while (size > 0 && (body[size - 1] == '\n' || body[size - 1] == '\r')) {
+        size--;
+    }
+
+    unsigned pos;
+    static const char word[] = "blocked";
+    if (size >= sizeof(word) - 1 && memcmp(body, word, sizeof(word) - 1) == 0) {
+        *blocked = true;
+        *counter = 0;
+        pos = sizeof(word) - 1;
+    } else {
+        *blocked = false;
+        pos = device_auth_parse_decimal(body, size, counter);
+        if (pos == 0) return false;
+    }
+
+    if (pos >= size || body[pos] != ' ') return false;
+    pos++;
+    unsigned n = device_auth_parse_decimal(body + pos, size - pos, echo);
+    if (n == 0) return false;
+    pos += n;
+
+    if (pos >= size || body[pos] != ' ') return false;
+    pos++;
+    if (size - pos != MOBILE_SHA256_SIZE * 2) return false;
+    for (unsigned i = 0; i < MOBILE_SHA256_SIZE * 2; i++) {
+        unsigned char ch = body[pos + i];
+        bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        if (!ok) return false;  // uppercase and anything else is not this format
+    }
+    *sig_hex = body + pos;
+    return true;
+}
+
+void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void *data, unsigned size)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+    struct mobile_adapter_commands *c = &adapter->commands;
+
+    if (!s->query_inflight) return;
+    s->query_inflight = false;
+    // Everything below that returns early leaves block_state UNKNOWN. That
+    //   is the fail-open rule: only a verified, fresh answer may say YES,
+    //   and nothing short of that may say NO either.
+    if (!data || size == 0) return;
+
+    bool blocked;
+    uint64_t value, echo;
+    const unsigned char *hex;
+    if (!device_auth_parse_answer(data, size, &blocked, &value, &echo, &hex)) {
+        debug_prefix(adapter);
+        mobile_debug_print(adapter, PSTR("Counter answer isn't in the expected form, ignored"));
+        mobile_debug_endl(adapter);
+        return;
+    }
+
+    // Not the answer to the query that went out -- whatever it is, and
+    //   however well it is signed. This is the whole defence against a
+    //   recorded answer being played back later.
+    if (echo != s->query_counter) {
+        debug_prefix(adapter);
+        mobile_debug_print(adapter, PSTR("Counter answer echoes a different query, ignored"));
+        mobile_debug_endl(adapter);
+        return;
+    }
+
+    unsigned char given[MOBILE_SHA256_SIZE];
+    for (unsigned i = 0; i < MOBILE_SHA256_SIZE; i++) {
+        unsigned char byte = 0;
+        for (unsigned j = 0; j < 2; j++) {
+            unsigned char ch = hex[i * 2 + j];
+            byte = (unsigned char)(byte << 4 |
+                (ch <= '9' ? ch - '0' : ch - 'a' + 10));
+        }
+        given[i] = byte;
+    }
+
+    unsigned char key[MOBILE_DEVICE_AUTH_KEY_SIZE];
+    if (!mobile_config_get_device_auth_key(adapter, key)) return;
+    if (c->ppp_id_size == 0 || c->ppp_id_size > 0x20) return;
+
+    // "ppp_id|device|query-response|<counter or blocked>|<echo>"
+    unsigned char message[MESSAGE_MAX_SIZE];
+    unsigned pos = device_auth_message_prefix(message, c->ppp_id,
+        c->ppp_id_size, device_auth_device_id(adapter), "query-response");
+    message[pos++] = '|';
+    if (blocked) {
+        memcpy(message + pos, "blocked", 7);
+        pos += 7;
+    } else {
+        pos += counter_to_decimal(value, message + pos);
+    }
+    message[pos++] = '|';
+    pos += counter_to_decimal(echo, message + pos);
+
+    unsigned char want[MOBILE_SHA256_SIZE];
+    mobile_hmac_sha256(key, sizeof(key), message, pos, want);
+
+    unsigned diff = 0;
+    for (unsigned i = 0; i < MOBILE_SHA256_SIZE; i++) diff |= given[i] ^ want[i];
+    if (diff != 0) {
+        debug_prefix(adapter);
+        mobile_debug_print(adapter, PSTR("Counter answer failed its signature, ignored"));
+        mobile_debug_endl(adapter);
+        return;
+    }
+
+    if (blocked) {
+        s->block_state = MOBILE_DEVICE_AUTH_BLOCK_YES;
+        // An authorization still waiting to go out would only be refused;
+        //   dropping it spares the round trip and the frontend a rejection
+        //   it would otherwise have to explain as something other than a
+        //   network fault.
+        s->pending = false;
+        debug_prefix(adapter);
+        mobile_debug_print(adapter, PSTR("Blocked by the server: no network this session"));
+        mobile_debug_endl(adapter);
+        return;
+    }
+
+    s->block_state = MOBILE_DEVICE_AUTH_BLOCK_NO;
+    if (mobile_config_device_auth_catch_up(adapter, value)) {
+        debug_prefix(adapter);
+        mobile_debug_print(adapter, PSTR("Counter caught up to the server"));
+        mobile_debug_endl(adapter);
+    }
 }
 
 // Starts (or restarts, for the next fallback candidate) resolution at
@@ -220,20 +589,74 @@ void mobile_device_auth_cancel(struct mobile_adapter *adapter)
     //   frees up again, rather than being lost.
 }
 
+// Sends whatever is due now that the address is known. Both the query and a
+//   queued event go out without any lookup in front of them.
+static void device_auth_dispatch_due(struct mobile_adapter *adapter)
+{
+    struct mobile_adapter_device_auth *s = &adapter->device_auth;
+
+    // The query first, so a counter corrected by the server is already in
+    //   place when the authorize that follows it is signed.
+    if (s->query_pending && !s->query_inflight) {
+        s->query_pending = false;
+        s->query_inflight = device_auth_dispatch_query(adapter);
+        if (s->query_inflight) {
+            mobile_cb_time_latch(adapter, MOBILE_TIMER_DEVICE_AUTH);
+        }
+    }
+
+    if (!s->pending) return;
+
+    // Signing an event while the answer to that query is still on its way
+    //   would use the counter it is about to correct -- and in the case that
+    //   makes the query worth doing at all, that means this event is
+    //   rejected and the game sees the failure. So wait for it, but only
+    //   briefly: an answer that never comes must not hold an authorize
+    //   hostage, since a stale counter is a maybe and a missing authorize is
+    //   a certainty.
+    if (s->query_inflight &&
+            !mobile_cb_time_check_ms(adapter, MOBILE_TIMER_DEVICE_AUTH, 3000)) {
+        return;
+    }
+
+    s->pending = false;
+    device_auth_sign_and_dispatch(adapter, s->addr_ipv4);
+}
+
 void mobile_device_auth_handle(struct mobile_adapter *adapter)
 {
     struct mobile_adapter_device_auth *s = &adapter->device_auth;
 
     if (s->state == MOBILE_DEVICE_AUTH_IDLE) {
-        if (!s->pending) return;
+        bool work = s->pending || s->query_pending;
+
+        // Already know where the server is: nothing to look up, send now.
+        if (s->addr_resolved) {
+            if (work) device_auth_dispatch_due(adapter);
+            return;
+        }
+
+        // With nothing to send yet, still resolve -- as soon as there is a
+        //   key and somewhere to ask. Getting the address out of the way
+        //   while idle is the whole point of keeping it: by the time an
+        //   authorize is due, there is no lookup left to wait for.
+        if (!work) {
+            if (s->addr_failed || !adapter->config.device_auth_key_init) return;
+        }
 
         int rc = device_auth_resolve_start(adapter, 0);
         if (rc == 0) return;  // No connection slot free right now, retry later
         if (rc < 0) {
-            debug_prefix(adapter);
-            mobile_debug_print(adapter, PSTR("No DNS server available, dropping"));
-            mobile_debug_endl(adapter);
-            s->pending = false;
+            if (work) {
+                debug_prefix(adapter);
+                mobile_debug_print(adapter, PSTR("No DNS server available, dropping"));
+                mobile_debug_endl(adapter);
+                s->pending = false;
+                s->query_pending = false;
+            }
+            // Nothing to send, so nothing was lost -- just stop trying until
+            //   a session gives a reason, and a DNS server, to try again.
+            s->addr_failed = true;
             return;
         }
         // fallthrough
@@ -252,6 +675,8 @@ void mobile_device_auth_handle(struct mobile_adapter *adapter)
             device_auth_release_conn(adapter);
             s->state = MOBILE_DEVICE_AUTH_IDLE;
             s->pending = false;
+            s->query_pending = false;
+            s->addr_failed = true;
             return;
         }
 
@@ -283,19 +708,24 @@ void mobile_device_auth_handle(struct mobile_adapter *adapter)
             }
 
             debug_prefix(adapter);
-            mobile_debug_print(adapter, PSTR("Resolution failed, dropping"));
+            mobile_debug_print(adapter, PSTR("Resolution failed"));
             mobile_debug_endl(adapter);
             s->pending = false;
+            s->query_pending = false;
+            s->addr_failed = true;
             return;
         }
 
-        s->pending = false;
+        // Kept for the rest of this adapter's run, so this is the only
+        //   lookup device-auth ever does.
+        memcpy(s->addr_ipv4, ip, sizeof(s->addr_ipv4));
+        s->addr_resolved = true;
 
         debug_prefix(adapter);
         mobile_debug_print(adapter, PSTR("Resolved to %u.%u.%u.%u"),
             ip[0], ip[1], ip[2], ip[3]);
         mobile_debug_endl(adapter);
 
-        device_auth_sign_and_dispatch(adapter, ip);
+        device_auth_dispatch_due(adapter);
     }
 }

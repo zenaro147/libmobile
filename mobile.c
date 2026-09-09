@@ -232,6 +232,7 @@ enum mobile_action mobile_actions_get(struct mobile_adapter *adapter)
                 !adapter->global.active &&
                 adapter->device_auth.state == MOBILE_DEVICE_AUTH_IDLE &&
                 !adapter->device_auth.pending &&
+                !adapter->device_auth.query_pending &&
                 adapter->global.number_fetch_retries &&
                 adapter->config.relay.type != MOBILE_ADDRTYPE_NONE)) {
         actions |= MOBILE_ACTION_INIT_NUMBER;
@@ -256,7 +257,8 @@ enum mobile_action mobile_actions_get(struct mobile_adapter *adapter)
     //   shared dns/relay socket buffer for their own protocol state.
     if (adapter->device_auth.state != MOBILE_DEVICE_AUTH_IDLE || (
                 !adapter->global.number_fetch_active &&
-                adapter->device_auth.pending)) {
+                (adapter->device_auth.pending ||
+                 adapter->device_auth.query_pending))) {
         actions |= MOBILE_ACTION_DEVICE_AUTH;
     }
 

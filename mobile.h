@@ -25,6 +25,21 @@ struct mobile_adapter;
 #define MOBILE_DEVICE_AUTH_SIG_SIZE 0x20
 #define MOBILE_DEVICE_AUTH_KEY_SIZE 0x20
 
+// Most identity bytes a frontend may hand to mobile_func_device_identity,
+//   and the size of the device id derived from them: 8 bytes, rendered as
+//   16 lowercase hex digits plus a terminator.
+#define MOBILE_DEVICE_IDENTITY_MAX_SIZE 0x40
+#define MOBILE_DEVICE_ID_SIZE 8
+#define MOBILE_DEVICE_ID_STR_SIZE (MOBILE_DEVICE_ID_SIZE * 2 + 1)
+
+// Longest frontend name mixed into the device id, not counting its
+//   terminator. Anything longer is truncated, which is harmless as long as
+//   the first characters already tell one frontend from another.
+#define MOBILE_IMPL_NAME_MAX_SIZE 0x1F
+
+// Size of the pairing code buffer, "XXXX-XXXX" plus its terminator.
+#define MOBILE_PAIRING_CODE_STR_SIZE 10
+
 // Utility defines
 #define MOBILE_SERIAL_IDLE_BYTE 0xD2
 #define MOBILE_SERIAL_IDLE_WORD 0xD2D2D2D2
@@ -83,6 +98,16 @@ enum mobile_device_auth_action {
 enum mobile_dns {
     MOBILE_DNS1,
     MOBILE_DNS2
+};
+
+// What the server has said, this session, about this device being blocked.
+//   Three states rather than a bool because "not blocked" is a claim that
+//   needs a verified answer behind it; absent one, the honest state is
+//   "don't know", and a frontend should show nothing rather than reassure.
+enum mobile_device_auth_block_state {
+    MOBILE_DEVICE_AUTH_BLOCK_UNKNOWN,   // no verified answer yet this session
+    MOBILE_DEVICE_AUTH_BLOCK_NO,        // server answered: not blocked
+    MOBILE_DEVICE_AUTH_BLOCK_YES        // server answered: blocked
 };
 
 struct mobile_addr4 {
@@ -369,6 +394,15 @@ void mobile_def_sock_accept(struct mobile_adapter *adapter, mobile_func_sock_acc
 // This function is non-blocking, and will be called repeatedly until all of
 // the data is sent, or a timeout triggers.
 //
+// Returning 0 is part of that, and is not an error: it means nothing could be
+// sent right now and the same data should be offered again on a later call.
+// Reserve -1 for a socket that is actually broken, since that aborts the
+// whole transfer. Transient backpressure from the underlying stack -- a full
+// send buffer or segment queue, a failed allocation for the outgoing packet
+// -- is the 0 case, as long as nothing was queued, and recovers by itself.
+// Reporting it as -1 turns a condition that would have cleared on the next
+// poll into a dead connection.
+//
 // Returns: non-negative amount of data sent on success, -1 on error
 // Parameters:
 // - conn: Socket number
@@ -498,9 +532,223 @@ void mobile_def_update_number(struct mobile_adapter *adapter, mobile_func_update
 // - addr_ipv4: the device-auth server's resolved address, MOBILE_HOSTLEN_IPV4
 //   bytes -- frontends never need to know its hostname or resolve it
 //   themselves
-typedef void (*mobile_func_update_device_auth)(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4);
-void mobile_impl_update_device_auth(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4);
+// - device: this device's id, as a null-terminated string of
+//   MOBILE_DEVICE_ID_SIZE * 2 lowercase hex digits, to be sent alongside the
+//   request. NULL when no mobile_func_device_identity callback is set, in
+//   which case the signed message omits it and the request must too -- the
+//   older form, which a server may still accept as identifying the account's
+//   one unnamed device. See mobile_func_device_identity.
+typedef void (*mobile_func_update_device_auth)(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4, const char *device);
+void mobile_impl_update_device_auth(void *user, enum mobile_device_auth_action action, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const unsigned char *addr_ipv4, const char *device);
 void mobile_def_update_device_auth(struct mobile_adapter *adapter, mobile_func_update_device_auth func);
+
+// mobile_func_device_identity - Identify this device for device-auth
+//
+// Writes up to <size> bytes that identify this particular device into
+// <data>, returning how many were written, or 0 if this platform has nothing
+// stable to offer. The library hashes whatever it gets and derives a fixed
+// device id from it (see the <device> parameter of
+// mobile_func_update_device_auth), so the bytes themselves never leave the
+// device and their format is entirely up to the frontend.
+//
+// What matters is only that the bytes are STABLE for this device across
+// reboots, and DIFFERENT from those of any other device using the same
+// account. They do not need to be secret, random, or unpredictable.
+//
+// "Any other device" includes another frontend on the same machine. Two of
+// them asking the operating system who it is get the same answer, so the
+// library mixes <impl_name> into the derivation to tell them apart. It is a
+// parameter of registering this callback rather than something to remember
+// separately, because forgetting it would produce a collision that looks
+// exactly like a counter bug and nothing like a missing string. Use a short
+// stable name for the frontend itself, not a version or a build. Where one
+// machine may serve several accounts or users at once, the identity bytes
+// are still the place to distinguish those -- including the OS user, say.
+//
+// Deliberately a callback rather than something the library stores: the
+// library's config storage is a blob a user may legitimately copy between
+// devices (the same config on an emulator and on real hardware, say), so an
+// id kept in there would identify the blob rather than the device, and both
+// would look like the same device to a server. Anything the frontend
+// persists for this purpose therefore belongs outside that blob.
+//
+// Suitable sources, roughly in order of preference: a hardware id (a Wi-Fi
+// MAC, a board id), a per-installation machine id (/etc/machine-id,
+// MachineGuid, IOPlatformUUID), or as a portable floor, the host name
+// combined with the user name. Note a MAC belonging to a removable interface
+// changes when that interface does, which makes the device look new.
+//
+// Leaving this callback unset is supported: the library then omits the
+// device id entirely and signs the older form of the message, which a server
+// may still accept as the account's single unnamed device.
+//
+// Returns: number of bytes written into <data>, 0 if unavailable
+// Parameters:
+// - data: buffer to write the identifying bytes into
+// - size: capacity of <data>, at least MOBILE_DEVICE_IDENTITY_MAX_SIZE
+typedef unsigned (*mobile_func_device_identity)(void *user, void *data, unsigned size);
+unsigned mobile_impl_device_identity(void *user, void *data, unsigned size);
+
+// <impl_name> names the frontend, and is mixed into the device id so two
+// frontends on one machine don't derive the same one. Up to
+// MOBILE_IMPL_NAME_MAX_SIZE characters, copied here, so it needn't outlive
+// this call. NULL or empty is treated as no identity at all, the same as
+// setting no callback: a device id that can't be told apart from another
+// frontend's is worse than none, since the server would take both for one
+// device and reject one of them as a replay of the other.
+//
+// Write it as a plain string literal, decided once and never touched again.
+// Not a build macro, a package name, or anything a rename could reach: the
+// name is an input to the hash, so changing it silently turns every device
+// running that frontend into a new one. For the same reason the spelling
+// itself is part of the agreement rather than a matter of taste --
+// "mgba" and "mGBA" are two different devices. Names in use:
+//
+//   "mgba"            mGBA
+//   "libmobile-bgb"   libmobile-bgb
+//   "picoadaptergb"   PicoAdapterGB
+//
+// Anything new goes on that list before it ships, not after.
+void mobile_def_device_identity(struct mobile_adapter *adapter, mobile_func_device_identity func, const char *impl_name);
+
+// mobile_func_device_auth_query - Ask the server what counter it last took
+//
+// Companion to mobile_func_update_device_auth, for the same side channel and
+// the same server, but read-only: it asks what counter value that server has
+// most recently accepted from this device, so a device that has lost or
+// rewound its own counter can resume from the right place instead of having
+// every request rejected until it happens to catch up.
+//
+// Fired once per session, before any authorization event. Implement it the
+// same way as mobile_func_update_device_auth -- same address, same style of
+// request, with an action naming a query rather than an authorization -- and
+// hand the server's answer back through mobile_device_auth_query_result().
+// Like every callback here it must not block: start the request, return, and
+// deliver the answer whenever it arrives.
+//
+// Leaving this unset is supported and costs only the recovery path; the
+// counter still advances normally on its own.
+//
+// Returns: true if the request was started, false if it couldn't be
+// Parameters:
+// - addr_ipv4: the server's resolved address, MOBILE_HOSTLEN_IPV4 bytes
+// - ppp_id, ppp_id_size: as in mobile_func_update_device_auth
+// - counter: value to send with the query, exactly as for an authorization
+//   (decimal, no leading zeros), and covered by <sig>. The server echoes it
+//   inside its signed answer, which is what lets the library tell a fresh
+//   answer from a recorded one being replayed at it. It is taken from the
+//   same sequence as authorization counters and never reused, so it is
+//   fresh even when nothing else about this device has changed -- which is
+//   precisely the situation of a device the server has blocked.
+// - sig: raw MOBILE_DEVICE_AUTH_SIG_SIZE-byte signature over this query
+// - device: this device's id, or NULL -- as in mobile_func_update_device_auth
+typedef bool (*mobile_func_device_auth_query)(void *user, const unsigned char *addr_ipv4, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const char *device);
+bool mobile_impl_device_auth_query(void *user, const unsigned char *addr_ipv4, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const char *device);
+void mobile_def_device_auth_query(struct mobile_adapter *adapter, mobile_func_device_auth_query func);
+
+// mobile_device_auth_query_result - Deliver the answer to a device-auth query
+//
+// Call this once for every mobile_func_device_auth_query() that returned
+// true, with the server's response body exactly as received, and nothing
+// else -- no terminator, no trimming. Pass NULL to report that the request
+// failed; the library then simply carries on with the counter it has.
+//
+// The library authenticates the answer before acting on it and ignores
+// anything it cannot verify, so an unauthenticated transport is acceptable
+// here. This matters twice over: the answer sets a counter, and a forged one
+// high enough would strand this device forever; and the answer may say the
+// server has blocked this device, on which the library refuses to bring up
+// the network for the session -- a signal anyone able to answer in the
+// server's place could otherwise use to deny service. See
+// mobile_device_auth_is_blocked().
+//
+// Safe to call at any time, including from a network callback of your own.
+//
+// Parameters:
+// - adapter: Library state
+// - data: response body as received, or NULL if the request failed
+// - size: length of data in bytes
+void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void *data, unsigned size);
+
+// mobile_device_auth_get_id - This device's id, as sent to the server
+//
+// Writes MOBILE_DEVICE_ID_STR_SIZE bytes into <buf>: the same lowercase hex
+// id the library puts in its requests, null-terminated. Useful for logs and
+// for anywhere the exact value matters; to show a user, prefer
+// mobile_device_auth_get_pairing_code().
+//
+// Returns false, leaving <buf> untouched, when this device has no id --
+// meaning no identity callback was registered, or it offered nothing.
+//
+// Returns: whether an id exists
+// Parameters:
+// - adapter: Library state
+// - buf: buffer of at least MOBILE_DEVICE_ID_STR_SIZE bytes
+bool mobile_device_auth_get_id(struct mobile_adapter *adapter, char *buf);
+
+// mobile_device_auth_block_state - Whether the server has blocked this device
+//
+// Reports what the server said, this session, when asked for the counter:
+// that this device is blocked -- something an account's owner does from the
+// server's device list, to stop one of their own devices using the account
+// -- or that it isn't, or nothing verifiable yet. Once it is YES, for the
+// rest of the session the library refuses to open connections or resolve
+// names on the game's behalf, so the game fails the way it does with no
+// network. Show the reason where the game's own error screen would
+// otherwise leave the user blaming their Wi-Fi.
+//
+// Fails open, deliberately. Only a signed answer that verifies, and that
+// echoes this session's own query, can produce YES; a missing answer, a
+// transport failure, a wrong status, a malformed or unverifiable body, all
+// leave UNKNOWN, which behaves exactly like NO. Anything else would let
+// someone unable to forge a "blocked" answer get the same effect by merely
+// dropping packets -- indistinguishable, to the user, from bad Wi-Fi. For
+// the same reason UNKNOWN is a state of its own and not folded into NO:
+// "not blocked" is a claim, and without an answer behind it the honest
+// thing for a frontend to show is nothing.
+//
+// This is cooperative by construction: the config storage carries the
+// account's credentials, so a device set on using them can. The server-side
+// answer to that is changing the password, not this. What this provides is
+// the owner's own devices honouring their wish, promptly and without
+// touching each one.
+//
+// Never persisted, and re-learned every session: unblocking on the server
+// takes effect on the device's next session with no action there. That also
+// bounds what a recorded "blocked" answer replayed at the device can do --
+// nothing beyond the sessions during which the replay is actually happening,
+// and only if it survives the freshness check described under
+// mobile_func_device_auth_query.
+//
+// Returns: the block state for this session
+// Parameters:
+// - adapter: Library state
+enum mobile_device_auth_block_state mobile_device_auth_block_state(struct mobile_adapter *adapter);
+
+// mobile_device_auth_get_pairing_code - This device's id, for a person
+//
+// Writes MOBILE_PAIRING_CODE_STR_SIZE bytes into <buf>: the first half of
+// the device id as "XXXX-XXXX", upper case, null-terminated. It exists so
+// somebody looking at a list of devices on a server can tell which entry is
+// the machine in front of them, and so is worth showing wherever that
+// question comes up -- a settings screen, a startup line, a status page.
+//
+// Formatted here rather than by each frontend because the code is only
+// useful if it matches, character for character, what the server shows for
+// the same device. A frontend rendering it in lower case, or grouping it
+// differently, produces something the user cannot match against the list
+// and has no way to tell is merely formatted differently.
+//
+// Being half the id, it identifies rather than authenticates: it is safe to
+// display, and useless for proving anything.
+//
+// Returns false, leaving <buf> untouched, when this device has no id.
+//
+// Returns: whether an id exists
+// Parameters:
+// - adapter: Library state
+// - buf: buffer of at least MOBILE_PAIRING_CODE_STR_SIZE bytes
+bool mobile_device_auth_get_pairing_code(struct mobile_adapter *adapter, char *buf);
 
 void mobile_config_set_device(struct mobile_adapter *adapter, enum mobile_adapter_device device, bool unmetered);
 void mobile_config_get_device(struct mobile_adapter *adapter, enum mobile_adapter_device *device, bool *unmetered);

@@ -121,3 +121,24 @@ endif()
 
 # Install the headers
 install(FILES ${headers} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Tests -- off by default when this is pulled in as a subproject (mGBA,
+#   libmobile-bgb, PicoAdapterGB all add_subdirectory() this), on when it's
+#   built directly.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    option(LIBMOBILE_BUILD_TESTS "Build the test suite" ON)
+else()
+    option(LIBMOBILE_BUILD_TESTS "Build the test suite" OFF)
+endif()
+
+if(LIBMOBILE_BUILD_TESTS)
+    enable_testing()
+    file(GLOB test_sources CONFIGURE_DEPENDS tests/*.c)
+    foreach(test_source ${test_sources})
+        get_filename_component(test_name ${test_source} NAME_WE)
+        add_executable(${test_name} ${test_source})
+        target_link_libraries(${test_name} PRIVATE libmobile)
+        target_compile_options(${test_name} PRIVATE ${c_args})
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endforeach()
+endif()

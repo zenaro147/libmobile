@@ -634,12 +634,13 @@ void mobile_def_device_identity(struct mobile_adapter *adapter, mobile_func_devi
 // - addr_ipv4: the server's resolved address, MOBILE_HOSTLEN_IPV4 bytes
 // - ppp_id, ppp_id_size: as in mobile_func_update_device_auth
 // - counter: value to send with the query, exactly as for an authorization
-//   (decimal, no leading zeros), and covered by <sig>. The server echoes it
-//   inside its signed answer, which is what lets the library tell a fresh
-//   answer from a recorded one being replayed at it. It is taken from the
-//   same sequence as authorization counters and never reused, so it is
-//   fresh even when nothing else about this device has changed -- which is
-//   precisely the situation of a device the server has blocked.
+//   (decimal, no leading zeros), and covered by <sig>. Taken from the same
+//   sequence as authorization counters and never reused, so this request is
+//   provably fresh regardless of anything else about the device -- but a
+//   cooperating server is not guaranteed to echo it back:
+//   mobile_device_auth_query_result() also accepts an answer with no echo
+//   at all, which is the ordinary, currently-live response form for this
+//   request. See its documentation.
 // - sig: raw MOBILE_DEVICE_AUTH_SIG_SIZE-byte signature over this query
 // - device: this device's id, or NULL -- as in mobile_func_update_device_auth
 typedef bool (*mobile_func_device_auth_query)(void *user, const unsigned char *addr_ipv4, const unsigned char *ppp_id, unsigned ppp_id_size, uint64_t counter, const unsigned char *sig, const char *device);
@@ -653,6 +654,19 @@ void mobile_def_device_auth_query(struct mobile_adapter *adapter, mobile_func_de
 // else -- no terminator, no trimming. Pass NULL to report that the request
 // failed; the library then simply carries on with the counter it has.
 //
+// Three response bodies are understood, and which one comes back is up to
+// the server, not something a frontend selects:
+// - "<counter> <sig>": the ordinary, currently-live form. Nothing here
+//   confirms this particular request triggered it -- only the signature
+//   authenticates it -- so a blocked device is never reported this way
+//   (see below).
+// - "<counter> <echo> <sig>": as above, plus an echo the library checks
+//   against the counter this request sent, the same freshness guarantee
+//   an authorization gets.
+// - "blocked <echo> <sig>": always carries the echo above, never the
+//   no-echo form -- there is no way to report a block without also
+//   proving this exact request produced it.
+//
 // The library authenticates the answer before acting on it and ignores
 // anything it cannot verify, so an unauthenticated transport is acceptable
 // here. This matters twice over: the answer sets a counter, and a forged one
@@ -660,7 +674,7 @@ void mobile_def_device_auth_query(struct mobile_adapter *adapter, mobile_func_de
 // server has blocked this device, on which the library refuses to bring up
 // the network for the session -- a signal anyone able to answer in the
 // server's place could otherwise use to deny service. See
-// mobile_device_auth_is_blocked().
+// mobile_device_auth_block_state().
 //
 // Safe to call at any time, including from a network callback of your own.
 //

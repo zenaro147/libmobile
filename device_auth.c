@@ -374,15 +374,25 @@ static unsigned device_auth_parse_decimal(const unsigned char *p, unsigned size,
 //   isn't one. Split out so every way of failing gets logged in one place:
 //   silently discarding an answer leaves nothing to tell "the server said
 //   something unexpected" apart from "the server never answered".
-// Body is exactly "<counter> <echo> <sig>" or "blocked <echo> <sig>": each
-//   number 1-20 digits without a leading zero, single spaces, 64 lowercase
-//   hex, and nothing else. Anything else is discarded rather than salvaged
-//   -- this sets a counter, and a bad one strands the device.
+// Body is one of three exact forms, distinguished by field count and first
+//   token:
+//   - "<counter> <sig>" -- the legacy/no-echo form, still live in
+//     production for a request that didn't carry a local value to echo.
+//     There is nothing here to defend a specific request against replay;
+//     the signature is all that authenticates it.
+//   - "<counter> <echo> <sig>" -- <echo> is whatever local value the
+//     request sent, signed back alongside the real answer.
+//   - "blocked <echo> <sig>" -- the server never emits this without an
+//     echo to sign; a blocked device queried without one gets refused at
+//     the transport level (an HTTP error) instead of a body to parse here.
+// Every number is 1-20 digits without a leading zero, fields are single
+//   spaces apart, the signature is 64 lowercase hex, and nothing else is
+//   tolerated -- this sets a counter, and a bad one strands the device.
 // Trailing CR/LF is the exception, and only because it is the one
 //   difference a server can add without meaning to (an echo with a
 //   newline, a proxy being helpful) and the one that costs nothing to
 //   accept: the signature covers the fields, not the framing around them.
-static bool device_auth_parse_answer(const void *data, unsigned size, bool *blocked, uint64_t *counter, uint64_t *echo, const unsigned char **sig_hex)
+static bool device_auth_parse_answer(const void *data, unsigned size, bool *blocked, uint64_t *counter, bool *has_echo, uint64_t *echo, const unsigned char **sig_hex)
 {
     const unsigned char *body = data;
     while (size > 0 && (body[size - 1] == '\n' || body[size - 1] == '\r')) {
@@ -403,12 +413,25 @@ static bool device_auth_parse_answer(const void *data, unsigned size, bool *bloc
 
     if (pos >= size || body[pos] != ' ') return false;
     pos++;
-    unsigned n = device_auth_parse_decimal(body + pos, size - pos, echo);
-    if (n == 0) return false;
-    pos += n;
 
-    if (pos >= size || body[pos] != ' ') return false;
-    pos++;
+    // Disambiguate the no-echo form from the echo one by length, not by
+    //   trying to parse a decimal first: a signature that happens to start
+    //   with digits would otherwise be misread as an echo field. A blocked
+    //   answer is never the no-echo form (see above), so this only ever
+    //   applies to the counter case.
+    if (!*blocked && size - pos == MOBILE_SHA256_SIZE * 2) {
+        *has_echo = false;
+        *echo = 0;
+    } else {
+        *has_echo = true;
+        unsigned n = device_auth_parse_decimal(body + pos, size - pos, echo);
+        if (n == 0) return false;
+        pos += n;
+
+        if (pos >= size || body[pos] != ' ') return false;
+        pos++;
+    }
+
     if (size - pos != MOBILE_SHA256_SIZE * 2) return false;
     for (unsigned i = 0; i < MOBILE_SHA256_SIZE * 2; i++) {
         unsigned char ch = body[pos + i];
@@ -431,10 +454,10 @@ void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void 
     //   and nothing short of that may say NO either.
     if (!data || size == 0) return;
 
-    bool blocked;
+    bool blocked, has_echo;
     uint64_t value, echo;
     const unsigned char *hex;
-    if (!device_auth_parse_answer(data, size, &blocked, &value, &echo, &hex)) {
+    if (!device_auth_parse_answer(data, size, &blocked, &value, &has_echo, &echo, &hex)) {
         debug_prefix(adapter);
         mobile_debug_print(adapter, PSTR("Counter answer isn't in the expected form, ignored"));
         mobile_debug_endl(adapter);
@@ -443,8 +466,9 @@ void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void 
 
     // Not the answer to the query that went out -- whatever it is, and
     //   however well it is signed. This is the whole defence against a
-    //   recorded answer being played back later.
-    if (echo != s->query_counter) {
+    //   recorded answer being played back later. The no-echo form has
+    //   nothing to check here: its only defense is the signature itself.
+    if (has_echo && echo != s->query_counter) {
         debug_prefix(adapter);
         mobile_debug_print(adapter, PSTR("Counter answer echoes a different query, ignored"));
         mobile_debug_endl(adapter);
@@ -466,7 +490,9 @@ void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void 
     if (!mobile_config_get_device_auth_key(adapter, key)) return;
     if (c->ppp_id_size == 0 || c->ppp_id_size > 0x20) return;
 
-    // "ppp_id|device|query-response|<counter or blocked>|<echo>"
+    // "ppp_id|device|query-response|<counter or blocked>", with a trailing
+    //   "|<echo>" only for the two forms that carry one -- the no-echo
+    //   form's signature covers nothing beyond the counter itself.
     unsigned char message[MESSAGE_MAX_SIZE];
     unsigned pos = device_auth_message_prefix(message, c->ppp_id,
         c->ppp_id_size, device_auth_device_id(adapter), "query-response");
@@ -477,8 +503,10 @@ void mobile_device_auth_query_result(struct mobile_adapter *adapter, const void 
     } else {
         pos += counter_to_decimal(value, message + pos);
     }
-    message[pos++] = '|';
-    pos += counter_to_decimal(echo, message + pos);
+    if (has_echo) {
+        message[pos++] = '|';
+        pos += counter_to_decimal(echo, message + pos);
+    }
 
     unsigned char want[MOBILE_SHA256_SIZE];
     mobile_hmac_sha256(key, sizeof(key), message, pos, want);

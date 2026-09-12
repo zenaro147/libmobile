@@ -766,12 +766,14 @@ void mobile_config_get_alt_mail(struct mobile_adapter *adapter, bool *alt_mail);
 // mobile_config_set_device_auth_key - Manually provision a device-auth key
 //
 // Sets the per-account secret used to sign device-auth requests (see
-// mobile_func_update_device_auth), and resets the associated replay counter
-// to 0, since it's meaningless against a key the server has never seen a
-// counter value for. Intended for manual provisioning/restore flows (e.g. a
-// frontend's own EEPROM/config editor); the library itself only ever
-// obtains one this way if it wasn't already present in config storage or
-// negotiated live via XPROVISION (see pop3_auth.h).
+// mobile_func_update_device_auth) and as the APOP secret for POP3
+// authentication (see pop3_auth.h), and resets the associated replay
+// counter to 0, since it's meaningless against a key the server has never
+// seen a counter value for. Intended for manual provisioning/restore flows
+// (e.g. a frontend's own EEPROM/config editor, or unpacking a key shipped
+// in a downloaded config.bin); the library itself never negotiates a key
+// live over any connection, so this is the only way one gets set if it
+// wasn't already present in config storage.
 //
 // Parameters:
 // - key: MOBILE_DEVICE_AUTH_KEY_SIZE bytes

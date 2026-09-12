@@ -65,6 +65,8 @@ set(sources
     dns.h
     global.h
     inet_pton.c
+    md5.c
+    md5.h
     mobile.c
     mobile_data.h
     pop3_auth.c

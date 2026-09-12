@@ -4,7 +4,7 @@
 #include <string.h>
 
 #include "mobile_data.h"
-#include "sha256.h"
+#include "md5.h"
 #include "compat.h"
 
 static void debug_prefix(struct mobile_adapter *adapter)
@@ -20,25 +20,6 @@ static void hex_encode(unsigned char *out, const unsigned char *data, unsigned s
         out[i * 2] = hex_digits[data[i] >> 4];
         out[i * 2 + 1] = hex_digits[data[i] & 0xf];
     }
-}
-
-static int hex_nibble(unsigned char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static bool hex_decode(unsigned char *out, const unsigned char *data, unsigned out_size)
-{
-    for (unsigned i = 0; i < out_size; i++) {
-        int hi = hex_nibble(data[i * 2]);
-        int lo = hex_nibble(data[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (unsigned char)(hi << 4 | lo);
-    }
-    return true;
 }
 
 // Appends [data, size) to buf (tracked by *len, capped at cap). Returns
@@ -59,6 +40,36 @@ static unsigned find_line(const unsigned char *buf, unsigned len)
         if (buf[i - 1] == '\r' && buf[i] == '\n') return i + 1;
     }
     return 0;
+}
+
+// Finds the last "<...>" token in a line -- the RFC 1939 challenge is
+//   whatever sits between (and including) the last '<' and the following
+//   '>'. Taking the *last* one is deliberate: it's cheap insurance against
+//   a greeting banner that happens to mention '<' earlier in free text.
+//   Returns the token's length (copied into out), or 0 if none is found or
+//   it wouldn't fit in out_cap -- callers treat both the same as "no
+//   challenge available".
+static unsigned find_challenge(const unsigned char *line, unsigned line_len, unsigned char *out, unsigned out_cap)
+{
+    int start = -1;
+    for (unsigned i = 0; i < line_len; i++) {
+        if (line[i] == '<') start = (int)i;
+    }
+    if (start < 0) return 0;
+
+    unsigned end = 0;
+    for (unsigned i = (unsigned)start + 1; i < line_len; i++) {
+        if (line[i] == '>') {
+            end = i;
+            break;
+        }
+    }
+    if (!end) return 0;
+
+    unsigned len = end - (unsigned)start + 1;
+    if (len > out_cap) return 0;
+    memcpy(out, line + start, len);
+    return len;
 }
 
 static void queue_for_game(struct mobile_pop3_auth *p, const unsigned char *data, unsigned len)
@@ -124,39 +135,38 @@ bool mobile_pop3_auth_done(struct mobile_adapter *adapter, unsigned conn)
         p->state == MOBILE_POP3_AUTH_DONE;
 }
 
-// Derives the per-purpose subkey and signs "ppp_id|nonce" with it, writing
-//   a full "XAPOP <ppp_id> <sig-hex>\r\n" line to out (which must be able
-//   to hold at least 0x20 + 1 + 0x20 + 1 + 64 + 2 bytes).
-static unsigned build_xapop(struct mobile_adapter *adapter, struct mobile_pop3_auth *p, unsigned char *out)
+// Derives the APOP digest per RFC 1939: MD5(challenge || secret). challenge
+//   is the token captured from the greeting, verbatim (angle brackets
+//   included). secret is the device_auth_key as 64 lowercase hex ASCII
+//   characters, not the raw 32 bytes -- that's the text form Dovecot's
+//   passdb actually holds, so it's what has to be on both sides of the
+//   comparison. Writes a full "APOP <ppp_id> <digest-hex>\r\n" line to out
+//   (which must be able to hold at least 5 + 0x20 + 1 + 32 + 2 bytes) and
+//   returns its length.
+static unsigned build_apop(struct mobile_adapter *adapter, struct mobile_pop3_auth *p, unsigned char *out)
 {
     struct mobile_adapter_commands *s = &adapter->commands;
 
     unsigned char key[MOBILE_DEVICE_AUTH_KEY_SIZE];
     mobile_config_get_device_auth_key(adapter, key);
+    unsigned char key_hex[MOBILE_DEVICE_AUTH_KEY_SIZE * 2];
+    hex_encode(key_hex, key, sizeof(key));
 
-    static const unsigned char subkey_label[] = "pop3-xapop";
-    unsigned char subkey[MOBILE_SHA256_SIZE];
-    mobile_hmac_sha256(key, sizeof(key), subkey_label, sizeof(subkey_label) - 1, subkey);
-
-    unsigned char message[0x20 + 1 + sizeof(p->nonce_hex)];
-    unsigned pos = 0;
-    memcpy(message + pos, s->ppp_id, s->ppp_id_size);
-    pos += s->ppp_id_size;
-    message[pos++] = '|';
-    memcpy(message + pos, p->nonce_hex, sizeof(p->nonce_hex));
-    pos += sizeof(p->nonce_hex);
-
-    unsigned char sig[MOBILE_SHA256_SIZE];
-    mobile_hmac_sha256(subkey, sizeof(subkey), message, pos, sig);
+    struct mobile_md5 ctx;
+    mobile_md5_init(&ctx);
+    mobile_md5_update(&ctx, p->challenge, p->challenge_len);
+    mobile_md5_update(&ctx, key_hex, sizeof(key_hex));
+    unsigned char digest[MOBILE_MD5_SIZE];
+    mobile_md5_final(&ctx, digest);
 
     unsigned n = 0;
-    memcpy(out + n, "XAPOP ", 6);
-    n += 6;
+    memcpy(out + n, "APOP ", 5);
+    n += 5;
     memcpy(out + n, s->ppp_id, s->ppp_id_size);
     n += s->ppp_id_size;
     out[n++] = ' ';
-    hex_encode(out + n, sig, sizeof(sig));
-    n += sizeof(sig) * 2;
+    hex_encode(out + n, digest, sizeof(digest));
+    n += sizeof(digest) * 2;
     out[n++] = '\r';
     out[n++] = '\n';
     return n;
@@ -182,22 +192,22 @@ static void process_line(struct mobile_adapter *adapter, struct mobile_pop3_auth
 
     switch (p->state) {
     case MOBILE_POP3_AUTH_GREETING: {
-        static const unsigned char prefix[] = "+OK service ready ";
-        unsigned prefix_len = sizeof(prefix) - 1;
-
-        p->has_key = adapter->config.device_auth_key_init;
-        if (line_len >= prefix_len + sizeof(p->nonce_hex) &&
-                memcmp(line, prefix, prefix_len) == 0) {
-            memcpy(p->nonce_hex, line + prefix_len, sizeof(p->nonce_hex));
-        } else {
-            // Not the greeting we expected -- can't do a signed exchange
-            //   without a nonce, so only the classic path remains usable.
-            p->has_key = false;
+        p->has_key = adapter->config.device_auth_key_init && line_is_ok(line);
+        if (p->has_key) {
+            p->challenge_len = find_challenge(line, line_len, p->challenge, sizeof(p->challenge));
+            if (!p->challenge_len) {
+                // No RFC 1939 challenge in the greeting -- can't build a
+                //   signed exchange, so only the classic path remains.
+                p->has_key = false;
+            }
         }
 
         debug_prefix(adapter);
-        mobile_debug_print(adapter, PSTR("Greeting seen, has_key=%u, nonce="), p->has_key);
-        mobile_debug_write(adapter, p->nonce_hex, sizeof(p->nonce_hex));
+        mobile_debug_print(adapter, PSTR("Greeting seen, has_key=%u"), p->has_key);
+        if (p->has_key) {
+            mobile_debug_print(adapter, PSTR(", challenge="));
+            mobile_debug_write(adapter, (const char *)p->challenge, p->challenge_len);
+        }
         mobile_debug_endl(adapter);
 
         queue_for_game(p, line, line_len);
@@ -207,8 +217,6 @@ static void process_line(struct mobile_adapter *adapter, struct mobile_pop3_auth
 
     case MOBILE_POP3_AUTH_USER:
         if (p->has_key) {
-            memcpy(p->saved_user, line, line_len);
-            p->saved_user_len = line_len;
             // Must match the real server's genuine USER response
             //   byte-for-byte: some POP3 clients validate more than just
             //   the leading '+' and silently never proceed to PASS if it
@@ -235,16 +243,14 @@ static void process_line(struct mobile_adapter *adapter, struct mobile_pop3_auth
         break;
 
     case MOBILE_POP3_AUTH_PASS:
-        memcpy(p->saved_pass, line, line_len);
-        p->saved_pass_len = line_len;
         if (p->has_key) {
-            unsigned char xapop[MOBILE_POP3_AUTH_LINE_MAX];
-            unsigned xapop_len = build_xapop(adapter, p, xapop);
-            queue_send(p, xapop, xapop_len, MOBILE_POP3_AUTH_RESP);
+            unsigned char apop[MOBILE_POP3_AUTH_LINE_MAX];
+            unsigned apop_len = build_apop(adapter, p, apop);
+            queue_send(p, apop, apop_len, MOBILE_POP3_AUTH_RESP);
 
             debug_prefix(adapter);
             mobile_debug_print(adapter, PSTR("PASS seen (%u bytes), sending: "), line_len);
-            mobile_debug_write(adapter, (const char *)xapop, xapop_len - 2);
+            mobile_debug_write(adapter, (const char *)apop, apop_len - 2);
             mobile_debug_endl(adapter);
         } else {
             queue_send(p, line, line_len, MOBILE_POP3_AUTH_RESP);
@@ -261,76 +267,20 @@ static void process_line(struct mobile_adapter *adapter, struct mobile_pop3_auth
         mobile_debug_write(adapter, (const char *)line, line_len >= 2 ? line_len - 2 : line_len);
         mobile_debug_endl(adapter);
 
-        if (line_is_ok(line)) {
-            if (p->has_key) {
-                queue_for_game(p, line, line_len);
-                p->state = MOBILE_POP3_AUTH_DONE;
-            } else {
-                memcpy(p->pending, line, line_len);
-                p->pending_len = line_len;
-                static const unsigned char provision[] = "XPROVISION\r\n";
-                queue_send(p, provision, sizeof(provision) - 1, MOBILE_POP3_AUTH_PROVISION_RESP);
-            }
-        } else if (p->has_key) {
-            // XAPOP was rejected (e.g. a revoked key) -- fall back to a
-            //   real login with what the game actually sent, instead of
-            //   breaking mail outright.
+        if (p->has_key && !line_is_ok(line)) {
+            // Deliberate: APOP is the only path once a key is provisioned,
+            //   and there is no fallback to the real mailbox password --
+            //   leaving an 8-character password enabled next to a 256-bit
+            //   secret would just be the door an attacker picks instead.
+            //   Make the failure loud rather than silently degrading.
             debug_prefix(adapter);
-            mobile_debug_print(adapter, PSTR("XAPOP rejected, falling back to real login"));
+            mobile_debug_print(adapter, PSTR("APOP REJECTED, no fallback: mail login failed"));
             mobile_debug_endl(adapter);
-            queue_send(p, p->saved_user, p->saved_user_len, MOBILE_POP3_AUTH_FALLBACK_USER_RESP);
-        } else {
-            queue_for_game(p, line, line_len);
-            p->state = MOBILE_POP3_AUTH_DONE;
-        }
-        break;
-
-    case MOBILE_POP3_AUTH_FALLBACK_USER_RESP:
-        // The game already got its (faked) "+OK" for USER earlier; this
-        //   real response is never shown to it.
-        queue_send(p, p->saved_pass, p->saved_pass_len, MOBILE_POP3_AUTH_FALLBACK_PASS_RESP);
-        break;
-
-    case MOBILE_POP3_AUTH_FALLBACK_PASS_RESP:
-        debug_prefix(adapter);
-        mobile_debug_print(adapter, PSTR("Fallback login response: "));
-        mobile_debug_write(adapter, (const char *)line, line_len >= 2 ? line_len - 2 : line_len);
-        mobile_debug_endl(adapter);
-
-        if (line_is_ok(line)) {
-            memcpy(p->pending, line, line_len);
-            p->pending_len = line_len;
-            static const unsigned char provision[] = "XPROVISION\r\n";
-            queue_send(p, provision, sizeof(provision) - 1, MOBILE_POP3_AUTH_PROVISION_RESP);
-        } else {
-            // The real password was wrong too -- this is a genuine
-            //   failure, not a stale-key problem.
-            queue_for_game(p, line, line_len);
-            p->state = MOBILE_POP3_AUTH_DONE;
-        }
-        break;
-
-    case MOBILE_POP3_AUTH_PROVISION_RESP: {
-        static const unsigned char prefix[] = "+OK ";
-        unsigned prefix_len = sizeof(prefix) - 1;
-        bool provisioned = false;
-        if (line_is_ok(line) && line_len >= prefix_len + 64) {
-            unsigned char key[MOBILE_DEVICE_AUTH_KEY_SIZE];
-            if (hex_decode(key, line + prefix_len, sizeof(key))) {
-                mobile_config_set_device_auth_key(adapter, key);
-                provisioned = true;
-            }
         }
 
-        debug_prefix(adapter);
-        mobile_debug_print(adapter, PSTR("XPROVISION response (%u bytes), provisioned=%u"), line_len, provisioned);
-        mobile_debug_endl(adapter);
-        // Whether or not provisioning worked, the real login already
-        //   succeeded -- release that result to the game either way.
-        queue_for_game(p, p->pending, p->pending_len);
+        queue_for_game(p, line, line_len);
         p->state = MOBILE_POP3_AUTH_DONE;
         break;
-    }
 
     case MOBILE_POP3_AUTH_INACTIVE:
     case MOBILE_POP3_AUTH_DONE:
@@ -391,9 +341,9 @@ int mobile_pop3_auth_recv(struct mobile_adapter *adapter, unsigned conn, void *d
         return mobile_cb_sock_recv(adapter, conn, data, size, NULL);
     }
 
-    // Finish sending whatever's queued (XAPOP, XPROVISION, a forwarded
-    //   USER/PASS, ...) before doing anything else -- there's nothing
-    //   meaningful to receive until the server has actually gotten it.
+    // Finish sending whatever's queued (APOP, a forwarded USER/PASS, ...)
+    //   before doing anything else -- there's nothing meaningful to
+    //   receive until the server has actually gotten it.
     int flush_rc = flush_send_retry(adapter, conn, p);
     if (flush_rc < 0) return -1;
     if (flush_rc == 0) return 0;

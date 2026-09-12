@@ -1075,7 +1075,7 @@ static struct mobile_packet *command_tcp_connect_connecting(struct mobile_adapte
 
     unsigned mail_port = packet->data[4] << 8 | packet->data[5];
 
-    // A POP3 connection needs line-level interception for XAPOP/XPROVISION
+    // A POP3 connection needs line-level interception for APOP
     //   (see pop3_auth.h), regardless of device-auth below.
     if (mail_port == 110) {
         s->mail_conn[conn] = true;

@@ -5,6 +5,8 @@ Library that implements the [Mobile Adapter GB](https://bulbapedia.bulbagarden.n
 
 This implementation prides itself in being the most complete recreation of the adapter, for which a lot of the research published on [Dan Docs](https://shonumi.github.io/dandocs.html#magb) has been made.
 
+**This fork's active development happens on [`feature/full_server`](https://github.com/zenaror/libmobile/tree/feature/full_server), not on `master`.** `master` tracks the original [REONTeam/libmobile](https://github.com/REONTeam/libmobile) upstream; everything specific to this fork (per-device authorization, blocking, mail authentication over APOP, the relay handshake carrying a device id) lives on that branch instead.
+
 
 Documentation
 -------------

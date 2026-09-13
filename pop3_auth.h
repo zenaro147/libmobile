@@ -29,12 +29,22 @@ struct mobile_adapter;
 //   just be the door an attacker picks instead. If APOP is rejected (e.g. a
 //   revoked key), the failure is real and is reported to the game as-is,
 //   loudly logged so it isn't mistaken for the classic no-key passthrough.
+//
+// CRAM-MD5, which a cooperating server may advertise alongside APOP, is
+//   evaluated and deliberately not implemented here: it replaces APOP's
+//   plain MD5(challenge || secret) with HMAC-MD5 over a server challenge,
+//   closing APOP's chosen-nonce weakness -- a weakness that only matters
+//   against a short, guessable secret. The secret here is a random 256-bit
+//   device_auth_key, against which that weakness recovers nothing useful.
 #define MOBILE_POP3_AUTH_LINE_MAX 128
 
-// Generous upper bound for the RFC 1939 challenge token, "<...>" included --
-//   real greetings seen in production are well under half this. If a
-//   greeting's token doesn't fit, it's treated the same as no token at all
-//   (has_key stays false, plain USER/PASS passthrough).
+// Generous upper bound for the RFC 1939 challenge token, "<...>" included.
+//   Not a protocol limit -- RFC 1939 doesn't set one -- just picked with
+//   plenty of room over the only real measurement available: Dovecot's
+//   production greeting, measured at 66 bytes on three separate occasions.
+//   If a greeting's token doesn't fit, it's treated the same as no token at
+//   all (has_key stays false, plain USER/PASS passthrough) -- there's no
+//   failure mode here worse than falling back to the classic no-key path.
 #define MOBILE_POP3_AUTH_CHALLENGE_MAX 96
 
 enum mobile_pop3_auth_state {
